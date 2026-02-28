@@ -1,0 +1,28 @@
+{
+  "name": "pi-context-lens",
+  "version": "0.1.0",
+  "description": "Model-driven context summarization extension for Pi Coding Agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "context",
+    "summarization"
+  ],
+  "author": "Eyal En Gad",
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.54.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.54.2",
+    "typescript": "^5.9.2"
+  }
+}
