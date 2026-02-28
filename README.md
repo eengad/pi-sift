@@ -14,3 +14,11 @@ npm install
 npm run check
 npm run build
 ```
+
+## Validation
+
+Run end-to-end phase-1 validation (typecheck + unit + flow tests):
+
+```bash
+npm run validate
+```
