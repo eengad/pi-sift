@@ -23,13 +23,6 @@ interface LensDecision {
 	timestamp: number;
 }
 
-interface DecisionEntry {
-	toolCallId?: unknown;
-	action?: unknown;
-	summary?: unknown;
-	timestamp?: unknown;
-}
-
 interface MessageTextBlock {
 	type?: string;
 	text?: string;
@@ -173,7 +166,31 @@ export default function contextLens(pi: ExtensionAPI) {
 	const pendingToolCallIds = new Set<string>();
 	const protectedFiles = new Map<string, number>();
 	let currentTurn = 0;
-	let transformedCount = 0;
+	let totalCharsSaved = 0;
+	let decisionsAppliedCount = 0;
+
+	const rebuildDecisions = (ctx: { sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> } }) => {
+		decisions.clear();
+		pendingToolCallIds.clear();
+		protectedFiles.clear();
+		currentTurn = 0;
+		totalCharsSaved = 0;
+		decisionsAppliedCount = 0;
+
+		const branch = ctx.sessionManager.getBranch();
+		for (const entry of branch) {
+			if (entry.type !== "custom") {
+				continue;
+			}
+			if (entry.customType !== CUSTOM_ENTRY_TYPE) {
+				continue;
+			}
+			const decision = parseDecisionPayload(entry.data);
+			if (decision) {
+				decisions.set(decision.toolCallId, decision);
+			}
+		}
+	};
 
 	const shouldProtectFile = (toolName: string, input: Record<string, unknown>): boolean => {
 		if (toolName !== "read") {
@@ -197,8 +214,8 @@ export default function contextLens(pi: ExtensionAPI) {
 				`mode=${config.mode}`,
 				`enabled=${String(config.enabled)}`,
 				`pending=${pendingToolCallIds.size}`,
-				`decisions=${decisions.size}`,
-				`transformed=${transformedCount}`,
+				`decisions=${decisions.size} (${decisionsAppliedCount} applied)`,
+				`chars saved≈${totalCharsSaved}`,
 			];
 			ctx.ui.notify(`[context-lens] ${lines.join(" | ")}`, "info");
 		},
@@ -206,27 +223,12 @@ export default function contextLens(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		config = loadConfig();
-		decisions.clear();
-		pendingToolCallIds.clear();
-		protectedFiles.clear();
-		currentTurn = 0;
-		transformedCount = 0;
+		rebuildDecisions(ctx);
+	});
 
-		const entries = ctx.sessionManager.getEntries();
-		for (const entry of entries) {
-			if (entry.type !== "custom") {
-				continue;
-			}
-			if (entry.customType !== CUSTOM_ENTRY_TYPE) {
-				continue;
-			}
-			const data = (entry as { data?: DecisionEntry }).data;
-			const decision = parseDecisionPayload(data);
-			if (!decision) {
-				continue;
-			}
-			decisions.set(decision.toolCallId, decision);
-		}
+	pi.on("session_switch", (_event, ctx) => {
+		config = loadConfig();
+		rebuildDecisions(ctx);
 	});
 
 	pi.on("turn_start", (event) => {
@@ -279,15 +281,19 @@ export default function contextLens(pi: ExtensionAPI) {
 		const instruction = [
 			"",
 			"[context-lens scoring task]",
-			"After your normal response, emit one <context_lens> JSON block for each listed toolCallId.",
-			"Schema: {\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}",
-			"Rules:",
-			"- keep: highly relevant; no summary required",
-			"- summarize: relevant but compressible; include concise summary",
-			"- dismiss: irrelevant; include one-line reason",
-			"- Fail-safe: if uncertain, use keep.",
-			`toolCallIds: ${ids.join(", ")}`,
-			"Use exactly this wrapper: <context_lens>{json}</context_lens>",
+			"After completing your normal response, score each listed tool result for relevance to the current task.",
+			"Emit one <context_lens> JSON block per toolCallId, at the END of your message.",
+			"",
+			"Schema: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}</context_lens>",
+			"",
+			"Actions:",
+			"- keep: content is directly relevant to what you're working on (e.g., file you'll modify, key API you're calling). No summary needed.",
+			"- summarize: partially relevant or large. Provide a concise summary: file path, key exports/functions, why it matters (2-4 lines).",
+			"- dismiss: not relevant. Provide a one-line reason (e.g., \"test fixtures for unrelated module\").",
+			"",
+			"Bias toward summarize over keep — you can always re-read the file. When uncertain, keep.",
+			``,
+			`toolCallIds to score: ${ids.join(", ")}`,
 		].join("\n");
 
 		pendingToolCallIds.clear();
@@ -362,9 +368,13 @@ export default function contextLens(pi: ExtensionAPI) {
 				continue;
 			}
 			const summary = (decision.summary || "Not relevant to current task.").trim();
+			const originalLength = extractTextLength(msg.content);
 			msg.content = [{ type: "text", text: summary }];
+			totalCharsSaved += Math.max(0, originalLength - summary.length);
 			changed = true;
-			transformedCount++;
+		}
+		if (changed) {
+			decisionsAppliedCount++;
 		}
 
 		if (changed) {
