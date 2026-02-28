@@ -22,3 +22,15 @@ Run end-to-end phase-1 validation (typecheck + unit + flow tests):
 ```bash
 npm run validate
 ```
+
+Run a **real Pi runtime** integration validation (requires authenticated `pi` model access):
+
+```bash
+npm run validate:real
+```
+
+Optional model override:
+
+```bash
+PI_VALIDATE_MODEL=openai-codex/gpt-5.3-codex npm run validate:real
+```

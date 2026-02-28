@@ -88,15 +88,22 @@ describe("phase-1 flow validation", () => {
 			isError: false,
 		});
 
-		const before = pi.emit("before_agent_start", {
-			type: "before_agent_start",
-			prompt: "refactor auth",
-			systemPrompt: "base prompt",
+		const injected = pi.emit("context", {
+			type: "context",
+			messages: [
+				{
+					role: "toolResult",
+					toolCallId: "tc-1",
+					content: [{ type: "text", text: "VERY LONG CONTENT" }],
+				},
+			],
 		})[0];
 
-		assert.ok(before);
-		assert.match(before.systemPrompt, /context-lens scoring task/);
-		assert.match(before.systemPrompt, /tc-1/);
+		assert.ok(injected);
+		const injectedUser = injected.messages.find((m: any) => m.role === "user");
+		assert.ok(injectedUser);
+		assert.match(injectedUser.content[0].text, /context-lens scoring task/);
+		assert.match(injectedUser.content[0].text, /tc-1/);
 
 		const assistantMessage = {
 			role: "assistant",

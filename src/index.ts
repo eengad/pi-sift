@@ -269,17 +269,8 @@ export default function contextLens(pi: ExtensionAPI) {
 		pendingToolCallIds.add(event.toolCallId);
 	});
 
-	pi.on("before_agent_start", (event) => {
-		if (!config.enabled || config.mode !== "piggyback") {
-			return;
-		}
-		if (pendingToolCallIds.size === 0) {
-			return;
-		}
-
-		const ids = Array.from(pendingToolCallIds);
-		const instruction = [
-			"",
+	const buildScoringInstruction = (ids: string[]): string =>
+		[
 			"[context-lens scoring task]",
 			"After completing your normal response, score each listed tool result for relevance to the current task.",
 			"Emit one <context_lens> JSON block per toolCallId, at the END of your message.",
@@ -292,16 +283,8 @@ export default function contextLens(pi: ExtensionAPI) {
 			"- dismiss: not relevant. Provide a one-line reason (e.g., \"test fixtures for unrelated module\").",
 			"",
 			"Bias toward summarize over keep — you can always re-read the file. When uncertain, keep.",
-			``,
 			`toolCallIds to score: ${ids.join(", ")}`,
 		].join("\n");
-
-		pendingToolCallIds.clear();
-
-		return {
-			systemPrompt: `${event.systemPrompt}\n${instruction}`,
-		};
-	});
 
 	pi.on("message_end", (event) => {
 		if (!config.enabled || config.mode !== "piggyback") {
@@ -347,34 +330,45 @@ export default function contextLens(pi: ExtensionAPI) {
 		if (!config.enabled || config.mode !== "piggyback") {
 			return;
 		}
-		if (decisions.size === 0) {
-			return;
-		}
 
 		let changed = false;
-		for (const msg of event.messages) {
-			if (!isObject(msg)) {
-				continue;
-			}
-			if (msg.role !== "toolResult") {
-				continue;
-			}
-			const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
-			if (!toolCallId) {
-				continue;
-			}
-			const decision = decisions.get(toolCallId);
-			if (!decision || decision.action === "keep") {
-				continue;
-			}
-			const summary = (decision.summary || "Not relevant to current task.").trim();
-			const originalLength = extractTextLength(msg.content);
-			msg.content = [{ type: "text", text: summary }];
-			totalCharsSaved += Math.max(0, originalLength - summary.length);
+
+		if (pendingToolCallIds.size > 0) {
+			const ids = Array.from(pendingToolCallIds);
+			pendingToolCallIds.clear();
+			event.messages.push({
+				role: "user",
+				content: [{ type: "text", text: buildScoringInstruction(ids) }],
+				timestamp: Date.now(),
+			});
 			changed = true;
 		}
-		if (changed) {
-			decisionsAppliedCount++;
+
+		if (decisions.size > 0) {
+			for (const msg of event.messages) {
+				if (!isObject(msg)) {
+					continue;
+				}
+				if (msg.role !== "toolResult") {
+					continue;
+				}
+				const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+				if (!toolCallId) {
+					continue;
+				}
+				const decision = decisions.get(toolCallId);
+				if (!decision || decision.action === "keep") {
+					continue;
+				}
+				const summary = (decision.summary || "Not relevant to current task.").trim();
+				const originalLength = extractTextLength(msg.content);
+				msg.content = [{ type: "text", text: summary }];
+				totalCharsSaved += Math.max(0, originalLength - summary.length);
+				changed = true;
+			}
+			if (changed) {
+				decisionsAppliedCount++;
+			}
 		}
 
 		if (changed) {
