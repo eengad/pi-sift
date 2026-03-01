@@ -15,6 +15,7 @@ RUN_TIMEOUT_SEC="${PI_BENCH_TIMEOUT_SEC:-900}"
 VERIFY_TIMEOUT_SEC="${PI_BENCH_VERIFY_TIMEOUT_SEC:-900}"
 WORK_ROOT="${PI_BENCH_WORK_ROOT:-$(mktemp -d)}"
 KEEP_WORKDIR="${PI_BENCH_KEEP_WORKDIR:-0}"
+CONFIGS="${PI_BENCH_CONFIGS:-baseline,extension}"
 
 SWE_REBENCH_URL="${PI_BENCH_SWE_REBENCH_URL:-https://github.com/DivyeshJayswal/SWE_ReBench.git}"
 SWE_REBENCH_DIR="${PI_BENCH_SWE_REBENCH_DIR:-$WORK_ROOT/SWE_ReBench}"
@@ -36,6 +37,8 @@ npm run build >/dev/null
 
 if [[ ! -d "$SWE_REBENCH_DIR/.git" ]]; then
   git clone --depth 1 "$SWE_REBENCH_URL" "$SWE_REBENCH_DIR" >/dev/null 2>&1
+  # Fix: Docker requires lowercase image tags; upstream _get_image_tag doesn't lowercase the repo name
+  sed -i 's/return f"swe-rebench\/{repo}/return f"swe-rebench\/{repo.lower()}/' "$SWE_REBENCH_DIR/execution_env.py" 2>/dev/null || true
 fi
 
 # Pull task rows from HF dataset-server preview endpoint (first-rows).
@@ -122,7 +125,8 @@ open(out, "w").write(prompt)
 PY
 
   for run_num in $(seq 1 "$RUNS_PER_TASK"); do
-    for config in baseline extension; do
+    IFS=',' read -ra CFG_LIST <<< "$CONFIGS"
+    for config in "${CFG_LIST[@]}"; do
       RUN_DIR="$TASK_DIR/${config}_run${run_num}"
       SESSION_DIR="$RUN_DIR/sessions"
       OUTPUT_FILE="$RUN_DIR/output.txt"
