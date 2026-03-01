@@ -4,11 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 type LensAction = "keep" | "summarize" | "dismiss";
-type LensMode = "piggyback" | "external-model";
 
 interface LensConfig {
 	enabled: boolean;
-	mode: LensMode;
 	tools: string[];
 	minCharsToScore: number;
 	editedFileProtectionTurns: number;
@@ -23,6 +21,15 @@ interface LensDecision {
 	timestamp: number;
 }
 
+interface PendingDecision {
+	toolCallId: string;
+	toolName: string;
+	size: number;
+	path?: string;
+	assistantMessagesSinceMarked: number;
+	instructionInjected: boolean;
+}
+
 interface MessageTextBlock {
 	type?: string;
 	text?: string;
@@ -30,7 +37,6 @@ interface MessageTextBlock {
 
 const DEFAULT_CONFIG: LensConfig = {
 	enabled: true,
-	mode: "piggyback",
 	tools: ["read", "grep", "bash"],
 	minCharsToScore: 2000,
 	editedFileProtectionTurns: 4,
@@ -40,101 +46,63 @@ const DEFAULT_CONFIG: LensConfig = {
 
 const CUSTOM_ENTRY_TYPE = "context_lens_decision";
 const BLOCK_REGEX = /<context_lens>([\s\S]*?)<\/context_lens>/g;
+const MARKER_PREFIX = "[CONTEXT_LENS_SCORE:";
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
 
-const extractTextLength = (content: unknown): number => {
-	if (typeof content === "string") {
-		return content.length;
-	}
-
-	if (!Array.isArray(content)) {
-		return 0;
-	}
-
-	let total = 0;
+const extractText = (content: unknown): string => {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
 	for (const part of content) {
-		if (!isObject(part)) {
-			continue;
-		}
-		if (part.type === "text" && typeof part.text === "string") {
-			total += part.text.length;
-		}
+		if (!isObject(part)) continue;
+		if (part.type === "text" && typeof part.text === "string") parts.push(part.text);
 	}
-	return total;
+	return parts.join("\n");
 };
 
+const extractTextLength = (content: unknown): number => extractText(content).length;
+
 const parseDecisionPayload = (payload: unknown): LensDecision | null => {
-	if (!isObject(payload)) {
-		return null;
-	}
-	const toolCallId = payload.toolCallId;
-	const action = payload.action;
-	const summary = payload.summary;
-	if (typeof toolCallId !== "string") {
-		return null;
-	}
-	if (action !== "keep" && action !== "summarize" && action !== "dismiss") {
-		return null;
-	}
-	if (summary !== undefined && typeof summary !== "string") {
-		return null;
-	}
-	return {
-		toolCallId,
-		action,
-		summary,
-		timestamp: Date.now(),
-	};
+	if (!isObject(payload)) return null;
+	const { toolCallId, action, summary } = payload;
+	if (typeof toolCallId !== "string") return null;
+	if (action !== "keep" && action !== "summarize" && action !== "dismiss") return null;
+	if (summary !== undefined && typeof summary !== "string") return null;
+	return { toolCallId, action, summary, timestamp: Date.now() };
 };
 
 const parseDecisionsFromText = (text: string): LensDecision[] => {
 	const decisions: LensDecision[] = [];
 	for (const match of text.matchAll(BLOCK_REGEX)) {
 		const payload = match[1]?.trim();
-		if (!payload) {
-			continue;
-		}
+		if (!payload) continue;
 		try {
 			const parsed = JSON.parse(payload);
 			const decision = parseDecisionPayload(parsed);
-			if (decision) {
-				decisions.push(decision);
-			}
+			if (decision) decisions.push(decision);
 		} catch {
-			// fail-safe: ignore malformed block and keep context unchanged
+			// fail-safe: ignore malformed block
 		}
 	}
 	return decisions;
 };
 
 const stripBlocks = (text: string): string =>
-	text
-		.replace(BLOCK_REGEX, "")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
+	text.replace(BLOCK_REGEX, "").replace(/\n{3,}/g, "\n\n").trim();
 
 const loadConfig = (): LensConfig => {
 	const configPath = join(homedir(), ".pi", "agent", "context-lens.json");
-	if (!existsSync(configPath)) {
-		return { ...DEFAULT_CONFIG };
-	}
-
+	if (!existsSync(configPath)) return { ...DEFAULT_CONFIG };
 	try {
 		const raw = readFileSync(configPath, "utf8");
 		const parsed = JSON.parse(raw);
-		if (!isObject(parsed)) {
-			return { ...DEFAULT_CONFIG };
-		}
+		if (!isObject(parsed)) return { ...DEFAULT_CONFIG };
 		return {
 			enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_CONFIG.enabled,
-			mode:
-				parsed.mode === "piggyback" || parsed.mode === "external-model"
-					? parsed.mode
-					: DEFAULT_CONFIG.mode,
 			tools: Array.isArray(parsed.tools)
-				? parsed.tools.filter((tool): tool is string => typeof tool === "string")
+				? parsed.tools.filter((t): t is string => typeof t === "string")
 				: DEFAULT_CONFIG.tools,
 			minCharsToScore:
 				typeof parsed.minCharsToScore === "number" ? parsed.minCharsToScore : DEFAULT_CONFIG.minCharsToScore,
@@ -151,59 +119,73 @@ const loadConfig = (): LensConfig => {
 };
 
 const getFilePathFromInput = (input: Record<string, unknown>): string | undefined => {
-	if (typeof input.path === "string") {
-		return input.path;
-	}
-	if (typeof input.filePath === "string") {
-		return input.filePath;
-	}
+	if (typeof input.path === "string") return input.path;
+	if (typeof input.filePath === "string") return input.filePath;
 	return undefined;
+};
+
+const canonicalToolCallId = (id: string): string => {
+	const pipe = id.indexOf("|");
+	return pipe === -1 ? id : id.slice(0, pipe);
+};
+
+const buildScoringInstruction = (items: PendingDecision[]): string => {
+	const idList = items.map((item) => item.toolCallId).join(", ");
+	const itemLines = items
+		.map((item) => `- ${item.toolCallId}: ${item.toolName}${item.path ? ` ${item.path}` : ""} (${item.size} chars)`)
+		.join("\n");
+
+	return [
+		"[context-lens scoring task]",
+		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
+		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}</context_lens>",
+		"",
+		"Actions:",
+		"- keep: full content should stay.",
+		"- summarize: compress to 2-4 lines with key details.",
+		"- dismiss: not relevant (one-line reason).",
+		"",
+		`toolCallIds to score: ${idList}`,
+		itemLines,
+	].join("\n");
 };
 
 export default function contextLens(pi: ExtensionAPI) {
 	let config = loadConfig();
 	const decisions = new Map<string, LensDecision>();
-	const pendingToolCallIds = new Set<string>();
+	const pendingDecisions = new Map<string, PendingDecision>();
 	const protectedFiles = new Map<string, number>();
 	let currentTurn = 0;
 	let totalCharsSaved = 0;
 	let decisionsAppliedCount = 0;
+	let hasMarkedResults = false;
+	const seenFilePaths = new Set<string>();
 
-	const rebuildDecisions = (ctx: { sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> } }) => {
+	const rebuildDecisions = (ctx: {
+		sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> };
+	}) => {
 		decisions.clear();
-		pendingToolCallIds.clear();
+		pendingDecisions.clear();
 		protectedFiles.clear();
+		seenFilePaths.clear();
 		currentTurn = 0;
 		totalCharsSaved = 0;
 		decisionsAppliedCount = 0;
 
 		const branch = ctx.sessionManager.getBranch();
 		for (const entry of branch) {
-			if (entry.type !== "custom") {
-				continue;
-			}
-			if (entry.customType !== CUSTOM_ENTRY_TYPE) {
-				continue;
-			}
+			if (entry.type !== "custom" || entry.customType !== CUSTOM_ENTRY_TYPE) continue;
 			const decision = parseDecisionPayload(entry.data);
-			if (decision) {
-				decisions.set(decision.toolCallId, decision);
-			}
+			if (decision) decisions.set(canonicalToolCallId(decision.toolCallId), decision);
 		}
 	};
 
 	const shouldProtectFile = (toolName: string, input: Record<string, unknown>): boolean => {
-		if (toolName !== "read") {
-			return false;
-		}
+		if (toolName !== "read") return false;
 		const path = getFilePathFromInput(input);
-		if (!path) {
-			return false;
-		}
+		if (!path) return false;
 		const editedTurn = protectedFiles.get(path);
-		if (editedTurn === undefined) {
-			return false;
-		}
+		if (editedTurn === undefined) return false;
 		return currentTurn - editedTurn <= config.editedFileProtectionTurns;
 	};
 
@@ -211,9 +193,7 @@ export default function contextLens(pi: ExtensionAPI) {
 		description: "Show basic pi-context-lens runtime stats",
 		handler: async (_args, ctx) => {
 			const lines = [
-				`mode=${config.mode}`,
 				`enabled=${String(config.enabled)}`,
-				`pending=${pendingToolCallIds.size}`,
 				`decisions=${decisions.size} (${decisionsAppliedCount} applied)`,
 				`chars saved≈${totalCharsSaved}`,
 			];
@@ -236,143 +216,190 @@ export default function contextLens(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_start", (event) => {
-		if (event.toolName !== "edit" && event.toolName !== "write") {
-			return;
-		}
-		if (!isObject(event.args)) {
-			return;
-		}
+		if (event.toolName !== "edit" && event.toolName !== "write") return;
+		if (!isObject(event.args)) return;
 		const path = getFilePathFromInput(event.args);
-		if (!path) {
-			return;
-		}
+		if (!path) return;
 		protectedFiles.set(path, currentTurn);
 	});
 
+	// Mark large tool results inline so the model sees the scoring request
 	pi.on("tool_result", (event) => {
-		if (!config.enabled || config.mode !== "piggyback") {
-			return;
-		}
-		if (event.isError) {
-			return;
-		}
-		if (!config.tools.includes(event.toolName)) {
-			return;
-		}
-		if (shouldProtectFile(event.toolName, event.input)) {
-			return;
-		}
+		if (!config.enabled) return;
+		if (event.isError) return;
+		if (!config.tools.includes(event.toolName)) return;
+		if (shouldProtectFile(event.toolName, event.input)) return;
+
 		const size = extractTextLength(event.content);
-		if (size < config.minCharsToScore) {
-			return;
+		if (size < config.minCharsToScore) return;
+
+		// Only score the first read of a file; re-reads are intentional and need full content
+		const path = isObject(event.input) ? getFilePathFromInput(event.input) : undefined;
+		if (path) {
+			if (seenFilePaths.has(path)) {
+				console.error(`[context-lens] skipping re-read of ${path}`);
+				return;
+			}
+			seenFilePaths.add(path);
 		}
-		pendingToolCallIds.add(event.toolCallId);
+
+		const canonicalId = canonicalToolCallId(event.toolCallId);
+		pendingDecisions.set(canonicalId, {
+			toolCallId: canonicalId,
+			toolName: event.toolName,
+			size,
+			path,
+			assistantMessagesSinceMarked: 0,
+			instructionInjected: false,
+		});
+
+		// Prepend lightweight marker inline; scoring instruction is injected via context hook.
+		const marker = `${MARKER_PREFIX}${event.toolCallId}] This result is ${size} chars.\n\n`;
+
+		hasMarkedResults = true;
+		console.error(`[context-lens] marking tool_result id=${event.toolCallId} size=${size}`);
+
+		const text = extractText(event.content);
+		return { content: [{ type: "text" as const, text: marker + text }] };
 	});
 
-	const buildScoringInstruction = (ids: string[]): string =>
-		[
-			"[context-lens scoring task]",
-			"After completing your normal response, score each listed tool result for relevance to the current task.",
-			"Emit one <context_lens> JSON block per toolCallId, at the END of your message.",
-			"",
-			"Schema: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}</context_lens>",
-			"",
-			"Actions:",
-			"- keep: content is directly relevant to what you're working on (e.g., file you'll modify, key API you're calling). No summary needed.",
-			"- summarize: partially relevant or large. Provide a concise summary: file path, key exports/functions, why it matters (2-4 lines).",
-			"- dismiss: not relevant. Provide a one-line reason (e.g., \"test fixtures for unrelated module\").",
-			"",
-			"Bias toward summarize over keep — you can always re-read the file. When uncertain, keep.",
-			`toolCallIds to score: ${ids.join(", ")}`,
-		].join("\n");
-
+	// Parse and strip <context_lens> blocks from assistant messages, persist decisions.
+	// Also apply a deterministic fallback so tool-call-only loops still get decisions.
 	pi.on("message_end", (event) => {
-		if (!config.enabled || config.mode !== "piggyback") {
-			return;
-		}
-		if (event.message.role !== "assistant") {
-			return;
-		}
+		if (!config.enabled) return;
+		if (event.message.role !== "assistant") return;
+
+		const persistDecision = (decision: LensDecision) => {
+			const canonicalId = canonicalToolCallId(decision.toolCallId);
+			const normalized: LensDecision = {
+				...decision,
+				toolCallId: canonicalId,
+				timestamp: decision.timestamp || Date.now(),
+			};
+			decisions.set(canonicalId, normalized);
+			pendingDecisions.delete(canonicalId);
+			if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, normalized);
+		};
 
 		const content = event.message.content;
 		if (typeof content === "string") {
 			const parsed = parseDecisionsFromText(content);
-			for (const decision of parsed) {
-				decisions.set(decision.toolCallId, decision);
-				if (!config.dryRun) {
-					pi.appendEntry(CUSTOM_ENTRY_TYPE, decision);
-				}
+			for (const decision of parsed) persistDecision(decision);
+		} else if (Array.isArray(content)) {
+			for (const block of content as MessageTextBlock[]) {
+				if (block?.type !== "text" || typeof block.text !== "string") continue;
+				const parsed = parseDecisionsFromText(block.text);
+				for (const decision of parsed) persistDecision(decision);
 			}
-			event.message.content = [{ type: "text", text: stripBlocks(content) }];
-			return;
 		}
 
-		if (!Array.isArray(content)) {
-			return;
-		}
-
-		for (const block of content as MessageTextBlock[]) {
-			if (block?.type !== "text" || typeof block.text !== "string") {
+		for (const [id, pending] of pendingDecisions) {
+			if (decisions.has(id)) {
+				pendingDecisions.delete(id);
 				continue;
 			}
-			const parsed = parseDecisionsFromText(block.text);
-			for (const decision of parsed) {
-				decisions.set(decision.toolCallId, decision);
-				if (!config.dryRun) {
-					pi.appendEntry(CUSTOM_ENTRY_TYPE, decision);
-				}
-			}
-			block.text = stripBlocks(block.text);
+
+			pending.assistantMessagesSinceMarked += 1;
+			if (pending.assistantMessagesSinceMarked < 2) continue;
+
+			const fallbackDecision: LensDecision = {
+				toolCallId: id,
+				action: "keep",
+				timestamp: Date.now(),
+			};
+			decisions.set(id, fallbackDecision);
+			pendingDecisions.delete(id);
+			if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, fallbackDecision);
+			console.error(`[context-lens] fallback decision applied id=${id} action=keep`);
 		}
 	});
 
+	// Inject scoring instruction for pending results + apply persisted decisions.
+	// Also strip <context_lens> blocks from older assistant messages to avoid
+	// leaking scoring metadata into the context window. The LAST assistant
+	// message is left untouched because the Anthropic API validates thinking
+	// block integrity for that message.
 	pi.on("context", (event) => {
-		if (!config.enabled || config.mode !== "piggyback") {
-			return;
-		}
+		if (!config.enabled) return;
 
 		let changed = false;
+		let decisionsAppliedThisPass = false;
 
-		if (pendingToolCallIds.size > 0) {
-			const ids = Array.from(pendingToolCallIds);
-			pendingToolCallIds.clear();
+		// Strip <context_lens> blocks from all assistant messages except the last one.
+		let lastAssistantIdx = -1;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			if (isObject(event.messages[i]) && event.messages[i].role === "assistant") {
+				lastAssistantIdx = i;
+				break;
+			}
+		}
+		for (let i = 0; i < event.messages.length; i++) {
+			const msg = event.messages[i];
+			if (!isObject(msg) || msg.role !== "assistant" || i === lastAssistantIdx) continue;
+			const content = msg.content;
+			if (typeof content === "string") {
+				const stripped = stripBlocks(content);
+				if (stripped !== content) {
+					msg.content = [{ type: "text", text: stripped }];
+					changed = true;
+				}
+			} else if (Array.isArray(content)) {
+				let blockChanged = false;
+				for (const block of content as MessageTextBlock[]) {
+					if (block?.type !== "text" || typeof block.text !== "string") continue;
+					const stripped = stripBlocks(block.text);
+					if (stripped !== block.text) {
+						block.text = stripped;
+						blockChanged = true;
+					}
+				}
+				if (blockChanged) {
+					// Remove empty text blocks that resulted from stripping
+					msg.content = (content as unknown as MessageTextBlock[]).filter(
+						(block) => block.type !== "text" || (typeof block.text === "string" && block.text !== ""),
+					) as unknown as typeof msg.content;
+					changed = true;
+				}
+			}
+		}
+
+		const toPrompt = Array.from(pendingDecisions.values()).filter((pending) => !pending.instructionInjected);
+		if (toPrompt.length > 0) {
 			event.messages.push({
 				role: "user",
-				content: [{ type: "text", text: buildScoringInstruction(ids) }],
+				content: [{ type: "text", text: buildScoringInstruction(toPrompt) }],
 				timestamp: Date.now(),
 			});
+			for (const pending of toPrompt) pending.instructionInjected = true;
 			changed = true;
 		}
 
-		if (decisions.size > 0) {
-			for (const msg of event.messages) {
-				if (!isObject(msg)) {
-					continue;
-				}
-				if (msg.role !== "toolResult") {
-					continue;
-				}
-				const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
-				if (!toolCallId) {
-					continue;
-				}
-				const decision = decisions.get(toolCallId);
-				if (!decision || decision.action === "keep") {
-					continue;
-				}
-				const summary = (decision.summary || "Not relevant to current task.").trim();
-				const originalLength = extractTextLength(msg.content);
-				msg.content = [{ type: "text", text: summary }];
-				totalCharsSaved += Math.max(0, originalLength - summary.length);
-				changed = true;
-			}
-			if (changed) {
-				decisionsAppliedCount++;
-			}
+		for (const msg of event.messages) {
+			if (!isObject(msg) || msg.role !== "toolResult") continue;
+			const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+			if (!toolCallId) continue;
+
+			const decision = decisions.get(canonicalToolCallId(toolCallId));
+			if (!decision || decision.action === "keep") continue;
+
+			const summary =
+				decision.action === "dismiss"
+					? `[context-lens dismissed: ${decision.summary || "not relevant"}]`
+					: decision.summary || "[context-lens: summarized]";
+
+			const originalLength = extractTextLength(msg.content);
+			if (originalLength <= summary.length) continue;
+
+			msg.content = [{ type: "text", text: summary }];
+			totalCharsSaved += Math.max(0, originalLength - summary.length);
+			decisionsAppliedThisPass = true;
+			changed = true;
 		}
 
-		if (changed) {
-			return { messages: event.messages };
-		}
+		if (decisionsAppliedThisPass) decisionsAppliedCount++;
+		if (changed) return { messages: event.messages };
 	});
 }
+
+// Re-export helpers for testing
+export { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText };
