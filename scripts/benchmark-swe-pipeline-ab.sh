@@ -37,8 +37,49 @@ npm run build >/dev/null
 
 if [[ ! -d "$SWE_REBENCH_DIR/.git" ]]; then
   git clone --depth 1 "$SWE_REBENCH_URL" "$SWE_REBENCH_DIR" >/dev/null 2>&1
-  # Fix: Docker requires lowercase image tags; upstream _get_image_tag doesn't lowercase the repo name
-  sed -i 's/return f"swe-rebench\/{repo}/return f"swe-rebench\/{repo.lower()}/' "$SWE_REBENCH_DIR/execution_env.py" 2>/dev/null || true
+  # Patch upstream bugs in execution_env.py:
+  # 1. Docker requires lowercase image tags
+  # 2. _parse_tests regex only matches verbose format, not -rA summary format
+  python3 - "$SWE_REBENCH_DIR/execution_env.py" <<'PATCH'
+import sys
+path = sys.argv[1]
+code = open(path).read()
+code = code.replace(
+    'return f"swe-rebench/{repo}',
+    'return f"swe-rebench/{repo.lower()}'
+)
+code = code.replace(
+    """    def _parse_tests(self, output: str) -> Tuple[List[str], List[str]]:
+        passed, failed = [], []
+        for m in re.finditer(r'(\S+::\S+)\s+PASSED', output):
+            passed.append(m.group(1))
+        for m in re.finditer(r'(\S+::\S+)\s+FAILED', output):
+            failed.append(m.group(1))
+        return passed, failed""",
+    """    def _parse_tests(self, output: str) -> Tuple[List[str], List[str]]:
+        passed, failed = set(), set()
+        for line in output.splitlines():
+            # verbose: "test::name PASSED"
+            m = re.search(r'(\S+::\S+)\s+PASSED', line)
+            if m:
+                passed.add(m.group(1))
+                continue
+            # -rA summary: "PASSED test::name"
+            m = re.search(r'PASSED\s+(\S+::\S+)', line)
+            if m:
+                passed.add(m.group(1))
+                continue
+            m = re.search(r'(\S+::\S+)\s+FAILED', line)
+            if m:
+                failed.add(m.group(1))
+                continue
+            m = re.search(r'FAILED\s+(\S+::\S+)', line)
+            if m:
+                failed.add(m.group(1))
+        return list(passed), list(failed)"""
+)
+open(path, 'w').write(code)
+PATCH
 fi
 
 # Pull task rows from HF dataset-server preview endpoint (first-rows).
