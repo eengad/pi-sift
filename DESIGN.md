@@ -1,4 +1,4 @@
-# pi-context-lens — Design Plan
+# pi-sift — Design Plan
 
 **Model-driven progressive context summarization for Pi coding agent**
 
@@ -58,7 +58,7 @@ Start with Mode A (piggyback) — no extra API key, no extra latency, works with
 ## Extension Structure
 
 ```
-pi-context-lens/
+pi-sift/
 ├── index.ts          # Main extension factory: registers all hooks
 ├── prompt.ts         # System prompt injection for context scoring
 ├── decisions.ts      # Decision Map: in-memory store + rebuild from session entries
@@ -72,7 +72,7 @@ pi-context-lens/
 
 ## Configuration
 
-`~/.pi/agent/context-lens.json`:
+`~/.pi/agent/pi-sift.json`:
 ```json
 {
   "enabled": true,
@@ -119,7 +119,7 @@ Instructs the agent to:
 
 4. **Budgeted, trigger-gated re-evaluation (off by default).** Use **probable task switch** as the primary trigger (user asks for a clearly different objective). Keep context-pressure/pre-compaction triggers optional and disabled by default, since built-in compaction already handles hard pressure. Never run on every turn. Limit work per turn (e.g., max 2 items / 6000 chars) so re-evaluation cost is capped and predictable.
 
-5. **Composability with RTK.** RTK strips syntactic noise (comments, ANSI, whitespace) first. context-lens evaluates semantic relevance on the already-cleaned output. They compose naturally.
+5. **Composability with RTK.** RTK strips syntactic noise (comments, ANSI, whitespace) first. pi-sift evaluates semantic relevance on the already-cleaned output. They compose naturally.
 
 6. **Escape hatch (no new tool).** If the agent needs previously summarized content, it should simply call the existing `read` tool again for that file (or range). No dedicated "restore" tool is needed.
 
@@ -134,7 +134,7 @@ Instructs the agent to:
 - Protect recently edited files (skip scoring for files written/edited within last N turns)
 - Fail-safe: on parse failure or malformed block, default to `keep`
 - `dryRun` mode: log decisions without applying them
-- Basic stats tracking (`/context-lens-stats` command)
+- Basic stats tracking (`/sift-stats` command)
 
 ### Phase 2 — External model mode (optional)
 - `tool_result` hook with external scorer call (e.g., gpt-4o-mini)
@@ -180,9 +180,9 @@ See [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) for detailed descriptions and impleme
 
 **[opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning)** (1,000+ ⭐) is the most architecturally similar project. It provides model-driven context reduction for OpenCode through registered tools (`distill`, `compress`, `prune`) plus rule-based strategies (deduplication, supersede-writes, purge-errors).
 
-**Key differences from pi-context-lens:**
+**Key differences from pi-sift:**
 
-| Aspect | DCP (OpenCode) | pi-context-lens (Pi) |
+| Aspect | DCP (OpenCode) | pi-sift (Pi) |
 |--------|---------------|---------------------|
 | **Mechanism** | Registers new tools the model must explicitly call | Piggyback — model scores inline as part of normal response |
 | **Extra tool calls** | Yes — model makes separate distill/compress/prune calls | No — zero extra tool calls |
@@ -192,7 +192,7 @@ See [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) for detailed descriptions and impleme
 | **Rule-based strategies** | Dedup, supersede-writes, purge-errors (zero LLM cost) | Not in scope (complementary with pi-rtk) |
 | **Conversation compression** | `compress` tool can collapse entire conversation ranges | Not in scope — focused on tool results only |
 
-DCP validated the problem space but took a fundamentally different approach: it gives the model a context management toolkit and relies on the model to use it. Pi-context-lens forces automatic evaluation on every large result without requiring model initiative or extra tool calls.
+DCP validated the problem space but took a fundamentally different approach: it gives the model a context management toolkit and relies on the model to use it. Pi-sift forces automatic evaluation on every large result without requiring model initiative or extra tool calls.
 
 ### Other references
 
@@ -256,7 +256,7 @@ The `<context_lens>` block emitted by the agent in its response must be stripped
 - **Decision persistence via `appendEntry`** — Required for session reload survival. `pi.appendEntry("context_lens_decision", ...)`.
 - **Shadow mode (`dryRun`)** — Good for V1 rollout. Log decisions without applying them.
 - **Smaller V1 scope** — Defer reevaluation, task-shift, pre-read gate to V2+.
-- **Extension load order matters** — `tool_result` handlers chain in `for (const ext of this.extensions)` order. RTK runs before/after context-lens depending on load order. Document this.
+- **Extension load order matters** — `tool_result` handlers chain in `for (const ext of this.extensions)` order. RTK runs before/after pi-sift depending on load order. Document this.
 
 ### Codex recommendations — deferred or rejected
 

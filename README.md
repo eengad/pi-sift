@@ -1,10 +1,11 @@
-# pi-context-lens
+# pi-sift
 
-`pi-context-lens` is a Pi Coding Agent extension that reduces context bloat by scoring large tool results and replacing low-value content with concise summaries in the LLM view.
+A Pi Coding Agent extension that reduces context bloat by having the model score large tool results for relevance and replacing low-value content with concise summaries.
 
 Current status: **initial implementation (Mode A / piggyback) scaffold**.
 
 - Design: [`DESIGN.md`](./DESIGN.md)
+- Improvement ideas: [`IMPROVEMENTS.md`](./IMPROVEMENTS.md)
 - Source: [`src/index.ts`](./src/index.ts)
 
 ## Local development
