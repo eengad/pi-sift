@@ -142,6 +142,16 @@ Instructs the agent to:
 - Simpler architecture (one hook, no `context` event)
 - A/B comparison mode to measure quality difference vs piggyback
 
+### Phase 2.5 — Zero-cost heuristic strategies
+Deterministic strategies that require no LLM calls, inspired by [opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning). These complement the model-driven scoring by handling cases where the right action is obvious from structure alone:
+- Auto-dismiss older read when the same file is re-read
+- Supersede-writes: dismiss write/edit inputs when the file is later read
+- General dedup: same tool + same args → keep only the most recent result
+- Purge error inputs after N turns (keep the error message, strip the input)
+- Protected file patterns (glob-based never-prune list, implement `excludePatterns` from config)
+
+See [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) for detailed descriptions and implementation notes.
+
 ### Phase 3 — Re-evaluation & advanced features
 - Budgeted, trigger-gated re-evaluation of older "keep" results
 - Protected file tracking refinements
@@ -150,11 +160,42 @@ Instructs the agent to:
 
 ## Prior Art
 
-- **pi-rtk** — Rule-based syntactic token reduction (comments, ANSI, truncation). Complementary, not competing.
+### Pi ecosystem
+
+- **pi-rtk** — Rule-based syntactic token reduction (comments, ANSI, truncation). Complementary, not competing — no semantic/relevance judgment.
 - **pi-context** — Git-like context management (tag/log/checkout). Agent-initiated, conversation-level. Different granularity.
-- **pi-agentic-compaction** — Virtual filesystem for compacted context. Good for post-compaction recovery.
-- **pi-readcache** — Read caching across compaction. Helps with false-negative re-reads.
-- **pi-read-map** — Structural file outlines. Precursor to summarize-on-read.
+- **pi-agentic-compaction** — Virtual filesystem for compacted context. Spawns a summarizer agent when compaction triggers. Conversation-level, not per-result.
+- **pi-readcache** — Hash-based read caching across compaction. Returns "unchanged" markers for re-reads. Deduplication, not relevance scoring.
+- **pi-read-map** — Structural file outlines for large files (tree-sitter). Precursor to the pre-read gate idea. Doesn't score or replace results.
+
+### Other coding agents
+
+- **OpenAI Codex CLI** — `context_manager/` + `compact.rs` + `truncate.rs`. Tool outputs are truncated by byte/token budget (blind size-based truncation). Conversation-level compaction via summarization prompt when context is full. No per-result relevance scoring.
+- **Claude Code** — `/compact` command for conversation-level summarization. Hooks system (`PreToolUse`, `PostToolUse`, etc.) exists for guards/notifications but not for modifying tool result content or the model's context view. 100+ community plugins checked — none do per-result relevance scoring. Closest: `claude-mem` (cross-session memory compression), `claude-code-tools` (post-compaction context recovery).
+- **Cline** — `ContextManager` does duplicate file read deduplication: when approaching context limits, replaces earlier reads of the same file with a note, keeping only the latest. Rule-based heuristic, not model-driven. Also does simple half/quarter truncation of old messages.
+- **OpenCode** — `SummaryMessageID` field suggests conversation-level summarization. Minimal context management. MCP-based extensibility but no per-result scoring in core or known plugins (Context Analysis Plugin is reporting only, not pruning).
+- **Aider** — `RepoMap` uses tree-sitter to build a repository symbol map for navigation. Doesn't evaluate individual tool results for relevance.
+
+### Closest competitor: opencode-dynamic-context-pruning (DCP)
+
+**[opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning)** (1,000+ ⭐) is the most architecturally similar project. It provides model-driven context reduction for OpenCode through registered tools (`distill`, `compress`, `prune`) plus rule-based strategies (deduplication, supersede-writes, purge-errors).
+
+**Key differences from pi-context-lens:**
+
+| Aspect | DCP (OpenCode) | pi-context-lens (Pi) |
+|--------|---------------|---------------------|
+| **Mechanism** | Registers new tools the model must explicitly call | Piggyback — model scores inline as part of normal response |
+| **Extra tool calls** | Yes — model makes separate distill/compress/prune calls | No — zero extra tool calls |
+| **Timing** | Retroactive — model reviews accumulated context and decides what to prune | Proactive — each result scored before it accumulates across turns |
+| **Trigger** | Agent-driven: model must recognize it should manage context, nudged periodically | Extension-driven: automatic on every large tool result |
+| **Granularity** | Model picks from a `<prunable-tools>` list of past tool outputs | Per-result: each tool result scored as it arrives |
+| **Rule-based strategies** | Dedup, supersede-writes, purge-errors (zero LLM cost) | Not in scope (complementary with pi-rtk) |
+| **Conversation compression** | `compress` tool can collapse entire conversation ranges | Not in scope — focused on tool results only |
+
+DCP validated the problem space but took a fundamentally different approach: it gives the model a context management toolkit and relies on the model to use it. Pi-context-lens forces automatic evaluation on every large result without requiring model initiative or extra tool calls.
+
+### Other references
+
 - **Kimi CLI d-mail** — Time travel on session tree with summaries. Inspiration for pi-context.
 - **ast-index** — AST-based code search. Attacks the "find right code before reading" problem instead.
 
