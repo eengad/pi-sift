@@ -10,7 +10,8 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test src/index.test.ts src/validation.test.ts",
     "validate": "npm run check && npm run test",
-    "validate:real": "./scripts/validate-real-pi.sh"
+    "validate:real": "./scripts/validate-real-pi.sh",
+    "benchmark:swe-pipeline-ab": "./scripts/benchmark-swe-pipeline-ab.sh"
   },
   "keywords": [
     "pi",

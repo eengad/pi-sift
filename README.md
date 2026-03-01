@@ -34,3 +34,28 @@ Optional model override:
 ```bash
 PI_VALIDATE_MODEL=openai-codex/gpt-5.3-codex npm run validate:real
 ```
+
+## A/B benchmark with SWE-ReBench verification pipeline (patch correctness)
+
+Run baseline vs extension and evaluate each generated patch with SWE_ReBench's Docker verification flow (`DockerEnvironment.verify_solution`):
+
+```bash
+npm run benchmark:swe-pipeline-ab
+```
+
+Optional overrides:
+
+```bash
+PI_BENCH_MODEL=openai-codex/gpt-5.3-codex \
+PI_BENCH_TASKS=1,2 \
+PI_BENCH_RUNS=1 \
+PI_BENCH_TIMEOUT_SEC=900 \
+PI_BENCH_VERIFY_TIMEOUT_SEC=900 \
+PI_BENCH_KEEP_WORKDIR=1 \
+npm run benchmark:swe-pipeline-ab
+```
+
+Notes:
+- Requires Docker running locally.
+- By default it clones `DivyeshJayswal/SWE_ReBench` into the workdir for verifier code.
+- This benchmark reports both efficiency metrics (latency/tokens/cost) and correctness (`resolved`).
