@@ -4,6 +4,12 @@ A Pi Coding Agent extension that reduces context bloat by having the model score
 
 Current status: **initial implementation (Mode A / piggyback) scaffold**.
 
+## Install
+
+```bash
+pi install https://github.com/eengad/pi-sift
+```
+
 - Design: [`DESIGN.md`](./DESIGN.md)
 - Improvement ideas: [`IMPROVEMENTS.md`](./IMPROVEMENTS.md)
 - Source: [`src/index.ts`](./src/index.ts)
