@@ -1,5 +1,5 @@
 {
-  "name": "pi-context-lens",
+  "name": "pi-sift",
   "version": "0.1.0",
   "description": "Model-driven context summarization extension for Pi Coding Agent",
   "type": "module",

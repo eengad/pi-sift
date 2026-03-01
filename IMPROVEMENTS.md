@@ -1,7 +1,7 @@
 # Potential Improvements
 
-## Rename to pi-sift
-Rename the repo, package, and all references from `pi-context-lens` to `pi-sift`. Shorter, more memorable, implies filtering. Wait until no other sessions have this worktree open to avoid conflicts. Touches: GitHub repo name, `package.json` name field, README, DESIGN.md, IMPROVEMENTS.md, and any import/config references.
+## ~~Rename to pi-sift~~ ✅ Done
+Renamed from `pi-context-lens`. Internal protocol strings (`<context_lens>`, `context_lens_decision`) kept as-is for session compatibility.
 
 ## Remove inline marker from tool_result hook
 The `[CONTEXT_LENS_SCORE:id]` marker prepended in the `tool_result` hook (`src/index.ts` line 257) may be redundant. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them. Removing the marker would reduce context size. Blocked on having a reliable way to verify it doesn't degrade scoring accuracy.

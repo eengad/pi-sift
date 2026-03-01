@@ -44,6 +44,8 @@ const DEFAULT_CONFIG: LensConfig = {
 	stats: true,
 };
 
+// NOTE: these protocol strings (XML tag, entry type, marker) are persisted in session
+// files. Do NOT rename them — it would break existing sessions on reload.
 const CUSTOM_ENTRY_TYPE = "context_lens_decision";
 const BLOCK_REGEX = /<context_lens>([\s\S]*?)<\/context_lens>/g;
 const MARKER_PREFIX = "[CONTEXT_LENS_SCORE:";
@@ -93,7 +95,8 @@ const stripBlocks = (text: string): string =>
 	text.replace(BLOCK_REGEX, "").replace(/\n{3,}/g, "\n\n").trim();
 
 const loadConfig = (): LensConfig => {
-	const configPath = join(homedir(), ".pi", "agent", "context-lens.json");
+	// Also check legacy config path for backwards compatibility
+	const configPath = join(homedir(), ".pi", "agent", "pi-sift.json");
 	if (!existsSync(configPath)) return { ...DEFAULT_CONFIG };
 	try {
 		const raw = readFileSync(configPath, "utf8");
@@ -136,7 +139,7 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 		.join("\n");
 
 	return [
-		"[context-lens scoring task]",
+		"[pi-sift scoring task]",
 		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
 		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}</context_lens>",
 		"",
@@ -150,7 +153,7 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 	].join("\n");
 };
 
-export default function contextLens(pi: ExtensionAPI) {
+export default function piSift(pi: ExtensionAPI) {
 	let config = loadConfig();
 	const decisions = new Map<string, LensDecision>();
 	const pendingDecisions = new Map<string, PendingDecision>();
@@ -189,15 +192,15 @@ export default function contextLens(pi: ExtensionAPI) {
 		return currentTurn - editedTurn <= config.editedFileProtectionTurns;
 	};
 
-	pi.registerCommand("context-lens-stats", {
-		description: "Show basic pi-context-lens runtime stats",
+	pi.registerCommand("sift-stats", {
+		description: "Show basic pi-sift runtime stats",
 		handler: async (_args, ctx) => {
 			const lines = [
 				`enabled=${String(config.enabled)}`,
 				`decisions=${decisions.size} (${decisionsAppliedCount} applied)`,
 				`chars saved≈${totalCharsSaved}`,
 			];
-			ctx.ui.notify(`[context-lens] ${lines.join(" | ")}`, "info");
+			ctx.ui.notify(`[pi-sift] ${lines.join(" | ")}`, "info");
 		},
 	});
 
@@ -237,7 +240,7 @@ export default function contextLens(pi: ExtensionAPI) {
 		const path = isObject(event.input) ? getFilePathFromInput(event.input) : undefined;
 		if (path) {
 			if (seenFilePaths.has(path)) {
-				console.error(`[context-lens] skipping re-read of ${path}`);
+				console.error(`[pi-sift] skipping re-read of ${path}`);
 				return;
 			}
 			seenFilePaths.add(path);
@@ -257,7 +260,7 @@ export default function contextLens(pi: ExtensionAPI) {
 		const marker = `${MARKER_PREFIX}${event.toolCallId}] This result is ${size} chars.\n\n`;
 
 		hasMarkedResults = true;
-		console.error(`[context-lens] marking tool_result id=${event.toolCallId} size=${size}`);
+		console.error(`[pi-sift] marking tool_result id=${event.toolCallId} size=${size}`);
 
 		const text = extractText(event.content);
 		return { content: [{ type: "text" as const, text: marker + text }] };
@@ -310,7 +313,7 @@ export default function contextLens(pi: ExtensionAPI) {
 			decisions.set(id, fallbackDecision);
 			pendingDecisions.delete(id);
 			if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, fallbackDecision);
-			console.error(`[context-lens] fallback decision applied id=${id} action=keep`);
+			console.error(`[pi-sift] fallback decision applied id=${id} action=keep`);
 		}
 	});
 
@@ -384,8 +387,8 @@ export default function contextLens(pi: ExtensionAPI) {
 
 			const summary =
 				decision.action === "dismiss"
-					? `[context-lens dismissed: ${decision.summary || "not relevant"}]`
-					: decision.summary || "[context-lens: summarized]";
+					? `[pi-sift dismissed: ${decision.summary || "not relevant"}]`
+					: decision.summary || "[pi-sift: summarized]";
 
 			const originalLength = extractTextLength(msg.content);
 			if (originalLength <= summary.length) continue;

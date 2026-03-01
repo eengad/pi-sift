@@ -55,7 +55,7 @@ describe("stripBlocks", () => {
 
 describe("Mode A inline marker flow", () => {
 	it("marks large tool results and strips decisions from responses", async () => {
-		const { default: contextLens } = await import("./index.js");
+		const { default: piSift } = await import("./index.js");
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 		const appended: Array<{ type: string; data: unknown }> = [];
 		const fakePi = {
@@ -66,7 +66,7 @@ describe("Mode A inline marker flow", () => {
 			registerCommand() {},
 			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
 		};
-		contextLens(fakePi as any);
+		piSift(fakePi as any);
 
 		// session_start
 		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
@@ -138,7 +138,7 @@ describe("Mode A inline marker flow", () => {
 	});
 
 	it("preserves thinking blocks in latest assistant message", async () => {
-		const { default: contextLens } = await import("./index.js");
+		const { default: piSift } = await import("./index.js");
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 		const appended: Array<{ type: string; data: unknown }> = [];
 		const fakePi = {
@@ -149,7 +149,7 @@ describe("Mode A inline marker flow", () => {
 			registerCommand() {},
 			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
 		};
-		contextLens(fakePi as any);
+		piSift(fakePi as any);
 
 		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
 
@@ -226,7 +226,7 @@ describe("Mode A inline marker flow", () => {
 	});
 
 	it("falls back to deterministic keep when assistant does tool-call-only turns", async () => {
-		const { default: contextLens } = await import("./index.js");
+		const { default: piSift } = await import("./index.js");
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 		const appended: Array<{ type: string; data: unknown }> = [];
 		const fakePi = {
@@ -237,7 +237,7 @@ describe("Mode A inline marker flow", () => {
 			registerCommand() {},
 			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
 		};
-		contextLens(fakePi as any);
+		piSift(fakePi as any);
 
 		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
 
