@@ -80,6 +80,117 @@ code = code.replace(
 )
 open(path, 'w').write(code)
 PATCH
+  # Patch models.py, dataset_loader.py, execution_env.py:
+  # 3. Add docker_image field to TaskInstance for pre-built image reference
+  # 4. Parse docker_image from HF dataset rows
+  # 5. Extract dep constraints from pre-built image and use during pip install
+  python3 - "$SWE_REBENCH_DIR/models.py" <<'PATCH_MODELS'
+import sys
+path = sys.argv[1]
+code = open(path).read()
+code = code.replace(
+    '    environment: Optional[str] = None  # Conda environment export',
+    '    environment: Optional[str] = None  # Conda environment export\n    docker_image: Optional[str] = None  # Pre-built evaluation image'
+)
+open(path, 'w').write(code)
+PATCH_MODELS
+  python3 - "$SWE_REBENCH_DIR/dataset_loader.py" <<'PATCH_LOADER'
+import sys
+path = sys.argv[1]
+code = open(path).read()
+code = code.replace(
+    "                environment=item.get('environment')\n            )",
+    "                environment=item.get('environment'),\n                docker_image=item.get('docker_image') or item.get('image_name')\n            )"
+)
+open(path, 'w').write(code)
+PATCH_LOADER
+  python3 - "$SWE_REBENCH_DIR/execution_env.py" <<'PATCH_CONSTRAINTS'
+import sys
+path = sys.argv[1]
+code = open(path).read()
+code = code.replace(
+    '    def verify_solution(self, task: TaskInstance, patch: str) -> Tuple[bool, ExecutionResult]:',
+    """    def _extract_constraints(self, docker_image: str) -> str:
+        \"\"\"Extract package version constraints from a pre-built SWE-bench image.\"\"\"
+        logger.info(f"Extracting constraints from {docker_image}")
+        self._run_cmd(["docker", "pull", "--platform", "linux/amd64", docker_image], timeout=300)
+        result = self._run_cmd([
+            "docker", "run", "--rm", "--platform", "linux/amd64", docker_image,
+            "bash", "-c", "ls /opt/conda/envs/testbed/lib/python*/site-packages/"
+        ], timeout=120)
+        constraints = []
+        if result.returncode == 0:
+            for entry in result.stdout.splitlines():
+                entry = entry.strip()
+                if entry.endswith('.dist-info'):
+                    name_ver = entry[:-len('.dist-info')]
+                    parts = name_ver.rsplit('-', 1)
+                    if len(parts) == 2:
+                        pkg, ver = parts
+                        pkg = pkg.replace('_', '-')
+                        constraints.append(f"{pkg}=={ver}")
+        logger.info(f"Extracted {len(constraints)} constraints")
+        return '\\n'.join(constraints)
+
+    def verify_solution(self, task: TaskInstance, patch: str) -> Tuple[bool, ExecutionResult]:""")
+old_install = (
+    '            # Install\n'
+    '            if task.install_config.install:\n'
+    '                self._exec_in_container(\n'
+    '                    container, f"cd repo && {task.install_config.install}",\n'
+    '                    timeout=300, check=False\n'
+    '                )')
+new_install = (
+    '            # Install\n'
+    '            if task.install_config.install:\n'
+    '                install_cmd = task.install_config.install\n'
+    '                used_constraints = False\n'
+    "                if hasattr(task, 'docker_image') and task.docker_image and install_cmd.startswith('pip install'):\n"
+    '                    try:\n'
+    '                        constraints = self._extract_constraints(task.docker_image)\n'
+    '                        if constraints:\n'
+    "                            self._copy_to_container(container, constraints, '/tmp/constraints.txt')\n"
+    "                            install_cmd = install_cmd + ' -c /tmp/constraints.txt'\n"
+    '                            used_constraints = True\n'
+    '                    except Exception as e:\n'
+    '                        logger.warning(f"Constraint extraction failed: {e}")\n'
+    '                self._exec_in_container(\n'
+    '                    container, f"cd repo && {install_cmd}",\n'
+    '                    timeout=300, check=False\n'
+    '                )\n'
+    '                # Smoke-test: verify the main module imports; if not, retry without constraints\n'
+    '                if used_constraints:\n'
+    "                    pkg_name = task.repo.split('/')[-1].replace('-', '_').lower()\n"
+    '                    smoke = self._exec_in_container(\n'
+    '                        container, f"cd /workspace/repo && python -c \\"import {pkg_name}\\" 2>&1",\n'
+    '                        check=False, timeout=30\n'
+    '                    )\n'
+    "                    if 'Error' in smoke or 'Traceback' in smoke:\n"
+    "                        logger.warning(f'Import check failed, attempting fix: {smoke[:200]}')\n"
+    "                        # Parse broken module from error and try prior major version\n"
+    "                        import re as _re\n"
+    "                        mod_match = _re.search(r\"module '(\\w+)\", smoke)\n"
+    "                        if mod_match:\n"
+    "                            broken_mod = mod_match.group(1)\n"
+    "                            ver_out = self._exec_in_container(container, f'pip show {broken_mod} 2>/dev/null', check=False, timeout=15)\n"
+    "                            ver_match = _re.search(r'Version:\\s*(\\d+)\\.(\\d+)', ver_out)\n"
+    "                            if ver_match:\n"
+    "                                major, minor = int(ver_match.group(1)), int(ver_match.group(2))\n"
+    "                                cap = f'{major}.{minor}' if minor > 0 else f'{major - 1}.0'\n"
+    "                                logger.info(f'Downgrading {broken_mod} to <{cap}')\n"
+    "                                self._exec_in_container(container, f'pip install \"{broken_mod}<{cap}\"', check=False, timeout=120)\n")
+code = code.replace(old_install, new_install)
+# Patch run_tests to only run the specific F2P + P2P tests instead of the entire suite
+code = code.replace(
+    '        test_cmd = task.install_config.test_cmd or "pytest --no-header -rA --tb=short"',
+    '        test_cmd = task.install_config.test_cmd or "pytest --no-header -rA --tb=short"\n'
+    '        # Append specific test IDs so we only run the relevant tests\n'
+    '        test_ids = list(set((task.fail_to_pass or []) + (task.pass_to_pass or [])))\n'
+    '        if test_ids:\n'
+    "            test_cmd += ' ' + ' '.join(test_ids)"
+)
+open(path, 'w').write(code)
+PATCH_CONSTRAINTS
 fi
 
 # Pull task rows from HF dataset-server preview endpoint (first-rows).
