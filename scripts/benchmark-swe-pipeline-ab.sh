@@ -202,33 +202,34 @@ open(path, 'w').write(code)
 PATCH_CONSTRAINTS
 fi
 
-# Pull task rows from HF dataset-server preview endpoint (first-rows).
-python3 - "$TASKS_JSON" "$DATASET" "$SPLIT" "$MAX_PROBLEM_CHARS" <<'PY'
+# Pull required task rows from HF dataset-server rows endpoint (supports pagination).
+python3 - "$TASKS_JSON" "$DATASET" "$SPLIT" "$MAX_PROBLEM_CHARS" "$TASK_INDICES" <<'PY'
 import json, sys, urllib.parse, urllib.request
-out_path, dataset, split, max_chars = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-url = (
-    "https://datasets-server.huggingface.co/first-rows?"
-    + urllib.parse.urlencode({"dataset": dataset, "config": "default", "split": split})
-)
-with urllib.request.urlopen(url) as r:
-    payload = json.load(r)
-rows = payload.get("rows", [])
-if not rows:
-    raise SystemExit("No rows returned from dataset-server first-rows endpoint")
+out_path, dataset, split, max_chars, indices_str = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
 
-# Keep full row for verification, but trim problem statement for prompting.
-tasks = []
-for entry in rows:
-    row = entry["row"]
+indices = sorted(set(int(i.strip()) for i in indices_str.split(",")))
+
+tasks = {}
+for idx in indices:
+    url = (
+        "https://datasets-server.huggingface.co/rows?"
+        + urllib.parse.urlencode({"dataset": dataset, "config": "default", "split": split, "offset": idx, "length": 1})
+    )
+    with urllib.request.urlopen(url) as r:
+        payload = json.load(r)
+    rows = payload.get("rows", [])
+    if not rows:
+        raise SystemExit(f"No row returned for index {idx}")
+    row = rows[0]["row"]
     repo = row["repo"].removeprefix("https://github.com/").removesuffix(".git")
     prompt_problem = (row.get("problem_statement", "") or "")[:max_chars]
-    tasks.append({
+    tasks[idx] = {
         "instance_id": row["instance_id"],
         "repo": repo,
         "base_commit": row["base_commit"],
         "problem_statement": prompt_problem,
         "raw_row": row,
-    })
+    }
 
 with open(out_path, "w") as f:
     json.dump(tasks, f)
@@ -245,9 +246,9 @@ for task_idx in "${INDICES[@]}"; do
   read -r INSTANCE_ID REPO BASE_COMMIT < <(python3 - "$TASKS_JSON" "$task_idx" <<'PY'
 import json,sys
 tasks=json.load(open(sys.argv[1]))
-idx=int(sys.argv[2])
-if idx < 0 or idx >= len(tasks):
-    raise SystemExit(f"Task index out of range: {idx} (available 0..{len(tasks)-1})")
+idx=str(int(sys.argv[2]))
+if idx not in tasks:
+    raise SystemExit(f"Task index {idx} not found in fetched tasks")
 t=tasks[idx]
 print(t['instance_id'], t['repo'], t['base_commit'])
 PY
@@ -264,7 +265,7 @@ PY
   python3 - "$TASKS_JSON" "$task_idx" "$PROMPT_FILE" <<'PY'
 import json,sys
 tasks=json.load(open(sys.argv[1]))
-idx=int(sys.argv[2])
+idx=str(int(sys.argv[2]))
 out=sys.argv[3]
 t=tasks[idx]
 prompt=f"""Solve this real SWE-rebench task in this checked-out repository.
@@ -333,7 +334,7 @@ PY
       python3 - "$SWE_REBENCH_DIR" "$TASKS_JSON" "$task_idx" "$PATCH_FILE" "$VERIFY_TIMEOUT_SEC" >"$VERIFY_FILE" <<'PY'
 import json, sys, time, traceback
 
-swe_dir, tasks_json, idx, patch_file, verify_timeout = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+swe_dir, tasks_json, idx, patch_file, verify_timeout = sys.argv[1], sys.argv[2], str(int(sys.argv[3])), sys.argv[4], int(sys.argv[5])
 sys.path.insert(0, swe_dir)
 
 result = {
