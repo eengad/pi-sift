@@ -32,10 +32,13 @@ def analyse(entries):
         print("  (none)")
     for d in decisions:
         tag = " [HEURISTIC]" if d["heuristic"] else ""
+        kl = f"  keepLines={d['keepLines']}" if d.get("keepLines") else ""
         print(
             f"  {d['action']:<10} id={d['toolCallId'][:30]}  "
             f"summary={d.get('summary', '')[:120]}{tag}"
         )
+        if kl:
+            print(f"  {' ' * 10} {kl}")
 
     # --- Build tool call index ---
     tool_calls = {}
