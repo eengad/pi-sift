@@ -231,7 +231,6 @@ def fetch_row(idx, retries=3):
 tasks = {}
 for idx in indices:
     row = fetch_row(idx)
-    row = rows[0]["row"]
     repo = row["repo"].removeprefix("https://github.com/").removesuffix(".git")
     prompt_problem = (row.get("problem_statement", "") or "")[:max_chars]
     tasks[idx] = {
