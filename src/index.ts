@@ -38,7 +38,7 @@ interface MessageTextBlock {
 const DEFAULT_CONFIG: LensConfig = {
 	enabled: true,
 	tools: ["read", "grep", "bash"],
-	minCharsToScore: 2000,
+	minCharsToScore: 5000,
 	editedFileProtectionTurns: 4,
 	dryRun: false,
 	stats: true,
@@ -148,6 +148,8 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 		"- summarize: compress to 2-4 lines with key details.",
 		"- dismiss: not relevant (one-line reason).",
 		"",
+		"Prefer summarize or dismiss — keeping costs tokens every turn; re-reading is cheap.",
+		"",
 		`toolCallIds to score: ${idList}`,
 		itemLines,
 	].join("\n");
@@ -162,7 +164,7 @@ export default function piSift(pi: ExtensionAPI) {
 	let totalCharsSaved = 0;
 	let decisionsAppliedCount = 0;
 	let hasMarkedResults = false;
-	const seenFilePaths = new Set<string>();
+	const readFileToolCallIds = new Map<string, { id: string; isFullRead: boolean }>(); // path → info
 
 	const rebuildDecisions = (ctx: {
 		sessionManager: { getBranch: () => Array<{ type: string; customType?: string; data?: unknown }> };
@@ -170,7 +172,7 @@ export default function piSift(pi: ExtensionAPI) {
 		decisions.clear();
 		pendingDecisions.clear();
 		protectedFiles.clear();
-		seenFilePaths.clear();
+		readFileToolCallIds.clear();
 		currentTurn = 0;
 		totalCharsSaved = 0;
 		decisionsAppliedCount = 0;
@@ -190,6 +192,21 @@ export default function piSift(pi: ExtensionAPI) {
 		const editedTurn = protectedFiles.get(path);
 		if (editedTurn === undefined) return false;
 		return currentTurn - editedTurn <= config.editedFileProtectionTurns;
+	};
+
+	const applyHeuristicDismiss = (toolCallId: string, reason: string) => {
+		const canonicalId = canonicalToolCallId(toolCallId);
+		if (decisions.get(canonicalId)?.action === "dismiss") return; // already dismissed
+		const decision: LensDecision = {
+			toolCallId: canonicalId,
+			action: "dismiss",
+			summary: reason,
+			timestamp: Date.now(),
+		};
+		decisions.set(canonicalId, decision);
+		pendingDecisions.delete(canonicalId);
+		if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, decision);
+		console.error(`[pi-sift] heuristic dismiss id=${canonicalId} reason=${reason}`);
 	};
 
 	pi.registerCommand("sift-stats", {
@@ -224,6 +241,13 @@ export default function piSift(pi: ExtensionAPI) {
 		const path = getFilePathFromInput(event.args);
 		if (!path) return;
 		protectedFiles.set(path, currentTurn);
+
+		// Auto-dismiss any earlier read of this file (content is now stale)
+		const previousRead = readFileToolCallIds.get(path);
+		if (previousRead) {
+			applyHeuristicDismiss(previousRead.id, `stale after edit of ${path}`);
+			readFileToolCallIds.delete(path);
+		}
 	});
 
 	// Mark large tool results inline so the model sees the scoring request
@@ -233,17 +257,25 @@ export default function piSift(pi: ExtensionAPI) {
 		if (!config.tools.includes(event.toolName)) return;
 		if (shouldProtectFile(event.toolName, event.input)) return;
 
+		const path = isObject(event.input) ? getFilePathFromInput(event.input) : undefined;
+
+		// Auto-dismiss old read when a file is re-read, but only if the old read was full-file.
+		// Only applies to "read" tool — grep/bash paths are search directories, not file content.
+		// Runs before the size threshold — dismissing the old read doesn't depend on the new read's size.
+		if (path && event.toolName === "read") {
+			const previous = readFileToolCallIds.get(path);
+			if (previous?.isFullRead) {
+				applyHeuristicDismiss(previous.id, `superseded by re-read of ${path}`);
+			}
+		}
+
 		const size = extractTextLength(event.content);
 		if (size < config.minCharsToScore) return;
 
-		// Only score the first read of a file; re-reads are intentional and need full content
-		const path = isObject(event.input) ? getFilePathFromInput(event.input) : undefined;
-		if (path) {
-			if (seenFilePaths.has(path)) {
-				console.error(`[pi-sift] skipping re-read of ${path}`);
-				return;
-			}
-			seenFilePaths.add(path);
+		// Only track read results large enough to score
+		const hasOffset = isObject(event.input) && (event.input.offset !== undefined || event.input.line !== undefined);
+		if (path && event.toolName === "read") {
+			readFileToolCallIds.set(path, { id: canonicalToolCallId(event.toolCallId), isFullRead: !hasOffset });
 		}
 
 		const canonicalId = canonicalToolCallId(event.toolCallId);
@@ -405,4 +437,4 @@ export default function piSift(pi: ExtensionAPI) {
 }
 
 // Re-export helpers for testing
-export { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText };
+export { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction };
