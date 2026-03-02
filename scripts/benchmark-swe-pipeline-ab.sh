@@ -5,10 +5,10 @@ set -euo pipefail
 # while comparing pi baseline vs pi-context-lens extension for latency/tokens/cost.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL="${PI_BENCH_MODEL:-openai-codex/gpt-5.3-codex}"
-DATASET="${PI_BENCH_DATASET:-nebius/SWE-rebench}"
+MODEL="${PI_BENCH_MODEL:-anthropic/claude-opus-4-6}"
+DATASET="${PI_BENCH_DATASET:-nebius/SWE-rebench-leaderboard}"
 SPLIT="${PI_BENCH_SPLIT:-test}"
-TASK_INDICES="${PI_BENCH_TASKS:-1,2}"
+TASK_INDICES="${PI_BENCH_TASKS:-0}"
 RUNS_PER_TASK="${PI_BENCH_RUNS:-1}"
 MAX_PROBLEM_CHARS="${PI_BENCH_MAX_PROBLEM_CHARS:-6000}"
 RUN_TIMEOUT_SEC="${PI_BENCH_TIMEOUT_SEC:-900}"
@@ -108,6 +108,15 @@ PATCH_LOADER
 import sys
 path = sys.argv[1]
 code = open(path).read()
+# Use bookworm-slim instead of plain slim to avoid Debian Trixie GPG signature errors
+code = code.replace(
+    'return f"swe-rebench/{repo.lower()}',
+    'return f"swe-rebench-bw/{repo.lower()}'
+)
+code = code.replace(
+    'f"""FROM python:{python_ver}-slim',
+    'f"""FROM python:{python_ver}-bookworm'
+)
 code = code.replace(
     '    def verify_solution(self, task: TaskInstance, patch: str) -> Tuple[bool, ExecutionResult]:',
     """    def _extract_constraints(self, docker_image: str) -> str:
@@ -284,6 +293,7 @@ PY
       OUTPUT_FILE="$RUN_DIR/output.txt"
       PATCH_FILE="$RUN_DIR/patch.diff"
       VERIFY_FILE="$RUN_DIR/verify.json"
+      rm -rf "$SESSION_DIR"
       mkdir -p "$SESSION_DIR"
 
       echo "  [$config] run $run_num/$RUNS_PER_TASK ..."
@@ -375,19 +385,20 @@ result["verify_time_sec"] = round(time.time() - start, 3)
 print(json.dumps(result))
 PY
 
-      session_file="$(find "$SESSION_DIR" -name '*.jsonl' | head -1 || echo '')"
+      session_files="$(find "$SESSION_DIR" -name '*.jsonl' | sort || echo '')"
 
-      python3 - "$session_file" "$OUTPUT_FILE" "$VERIFY_FILE" "$PATCH_FILE" "$elapsed" "$config" "$INSTANCE_ID" "$run_num" "$task_idx" "$run_rc" >>"$RESULTS_FILE" <<'PY'
+      python3 - "$OUTPUT_FILE" "$VERIFY_FILE" "$PATCH_FILE" "$elapsed" "$config" "$INSTANCE_ID" "$run_num" "$task_idx" "$run_rc" $session_files >>"$RESULTS_FILE" <<'PY'
 import json, sys
-session_file, output_file, verify_file, patch_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-elapsed, config, instance_id = int(sys.argv[5]), sys.argv[6], sys.argv[7]
-run_num, task_idx, run_rc = int(sys.argv[8]), int(sys.argv[9]), int(sys.argv[10])
+output_file, verify_file, patch_file = sys.argv[1], sys.argv[2], sys.argv[3]
+elapsed, config, instance_id = int(sys.argv[4]), sys.argv[5], sys.argv[6]
+run_num, task_idx, run_rc = int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9])
+session_files = sys.argv[10:]
 
 usage_in = usage_out = usage_total = 0
 cost_total = 0.0
 assistant_msgs = tool_results = custom_decisions = lens_blocks = 0
 
-if session_file:
+for session_file in session_files:
     with open(session_file) as f:
         for line in f:
             o = json.loads(line)
