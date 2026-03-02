@@ -50,16 +50,27 @@ Run baseline vs extension and evaluate each generated patch with SWE_ReBench's D
 npm run benchmark:swe-pipeline-ab
 ```
 
-Optional overrides:
+Defaults: model `anthropic/claude-opus-4-6`, dataset `nebius/SWE-rebench-leaderboard`, task 0. Override with env vars:
 
 ```bash
-PI_BENCH_MODEL=openai-codex/gpt-5.3-codex \
-PI_BENCH_TASKS=1,2 \
+PI_BENCH_MODEL=anthropic/claude-opus-4-6 \
+PI_BENCH_DATASET=nebius/SWE-rebench-leaderboard \
+PI_BENCH_TASKS=0,1,2 \
+PI_BENCH_CONFIGS=extension \
 PI_BENCH_RUNS=1 \
 PI_BENCH_TIMEOUT_SEC=900 \
-PI_BENCH_VERIFY_TIMEOUT_SEC=900 \
 PI_BENCH_KEEP_WORKDIR=1 \
 npm run benchmark:swe-pipeline-ab
+```
+
+`PI_BENCH_CONFIGS` can be `baseline,extension` (default, A/B comparison) or `extension` (skip baseline to save time/cost when iterating on the extension).
+
+### Analyse session logs
+
+After a benchmark run with `PI_BENCH_KEEP_WORKDIR=1`, inspect the extension's decisions and timeline:
+
+```bash
+npm run analyse-session -- /tmp/tmp.XXX/task_0/extension_run1/sessions/*.jsonl
 ```
 
 Notes:
