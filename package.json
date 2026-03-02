@@ -1,7 +1,7 @@
 {
   "name": "pi-sift",
-  "version": "0.1.0",
-  "description": "Model-driven context summarization extension for Pi Coding Agent",
+  "version": "0.1.2",
+  "description": "Model-scored compression of large tool results for Pi Coding Agent",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,6 +18,7 @@
     "analyse-session": "python3 ./scripts/analyse-session.py"
   },
   "keywords": [
+    "pi-package",
     "pi",
     "pi-coding-agent",
     "extension",
