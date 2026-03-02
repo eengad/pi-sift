@@ -204,22 +204,33 @@ fi
 
 # Pull required task rows from HF dataset-server rows endpoint (supports pagination).
 python3 - "$TASKS_JSON" "$DATASET" "$SPLIT" "$MAX_PROBLEM_CHARS" "$TASK_INDICES" <<'PY'
-import json, sys, urllib.parse, urllib.request
+import json, sys, time, urllib.parse, urllib.request
 out_path, dataset, split, max_chars, indices_str = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
 
 indices = sorted(set(int(i.strip()) for i in indices_str.split(",")))
 
-tasks = {}
-for idx in indices:
+def fetch_row(idx, retries=3):
     url = (
         "https://datasets-server.huggingface.co/rows?"
         + urllib.parse.urlencode({"dataset": dataset, "config": "default", "split": split, "offset": idx, "length": 1})
     )
-    with urllib.request.urlopen(url) as r:
-        payload = json.load(r)
-    rows = payload.get("rows", [])
-    if not rows:
-        raise SystemExit(f"No row returned for index {idx}")
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url) as r:
+                payload = json.load(r)
+            rows = payload.get("rows", [])
+            if not rows:
+                raise RuntimeError(f"No row returned for index {idx}")
+            return rows[0]["row"]
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise SystemExit(f"Failed to fetch row {idx} after {retries} attempts: {e}")
+
+tasks = {}
+for idx in indices:
+    row = fetch_row(idx)
     row = rows[0]["row"]
     repo = row["repo"].removeprefix("https://github.com/").removesuffix(".git")
     prompt_problem = (row.get("problem_statement", "") or "")[:max_chars]
