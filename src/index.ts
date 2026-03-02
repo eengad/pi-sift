@@ -18,6 +18,8 @@ interface LensDecision {
 	toolCallId: string;
 	action: LensAction;
 	summary?: string;
+	keepLines?: [number, number][];
+	cachedReplacement?: string;
 	timestamp: number;
 }
 
@@ -66,13 +68,40 @@ const extractText = (content: unknown): string => {
 
 const extractTextLength = (content: unknown): number => extractText(content).length;
 
+const extractLineRange = (text: string, ranges: [number, number][]): string => {
+	const lines = text.split("\n");
+	const kept: string[] = [];
+	for (const [start, end] of ranges) {
+		// 1-based line numbers → 0-based indices
+		const lo = Math.max(0, start - 1);
+		const hi = Math.min(lines.length, end);
+		for (let i = lo; i < hi; i++) {
+			kept.push(lines[i]);
+		}
+	}
+	return kept.join("\n");
+};
+
+const isValidKeepLines = (value: unknown): value is [number, number][] => {
+	if (!Array.isArray(value)) return false;
+	for (const item of value) {
+		if (!Array.isArray(item) || item.length !== 2) return false;
+		if (typeof item[0] !== "number" || typeof item[1] !== "number") return false;
+		if (item[0] < 1 || item[1] < item[0]) return false;
+	}
+	return true;
+};
+
 const parseDecisionPayload = (payload: unknown): LensDecision | null => {
 	if (!isObject(payload)) return null;
-	const { toolCallId, action, summary } = payload;
+	const { toolCallId, action, summary, keepLines } = payload;
 	if (typeof toolCallId !== "string") return null;
 	if (action !== "keep" && action !== "summarize" && action !== "dismiss") return null;
 	if (summary !== undefined && typeof summary !== "string") return null;
-	return { toolCallId, action, summary, timestamp: Date.now() };
+	if (keepLines !== undefined && !isValidKeepLines(keepLines)) return null;
+	const decision: LensDecision = { toolCallId, action, summary, timestamp: Date.now() };
+	if (keepLines !== undefined) decision.keepLines = keepLines as [number, number][];
+	return decision;
 };
 
 const parseDecisionsFromText = (text: string): LensDecision[] => {
@@ -141,11 +170,13 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 	return [
 		"[pi-sift scoring task]",
 		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
-		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\"}</context_lens>",
+		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\",\"keepLines\":[[start,end],...]}</context_lens>",
+		"",
+		"Tool results are line-numbered (N<tab>content). Use these numbers for keepLines ranges.",
 		"",
 		"Actions:",
 		"- keep: full content should stay.",
-		"- summarize: compress to 2-4 lines with key details.",
+		"- summarize: compress to 2-4 lines. Use keepLines with [start,end] line ranges to preserve critical code verbatim — these lines stay in context, no need to re-read them.",
 		"- dismiss: not relevant (one-line reason).",
 		"",
 		"Prefer summarize or dismiss — keeping costs tokens every turn; re-reading is cheap.",
@@ -242,11 +273,17 @@ export default function piSift(pi: ExtensionAPI) {
 		if (!path) return;
 		protectedFiles.set(path, currentTurn);
 
-		// Auto-dismiss any earlier read of this file (content is now stale)
+		// Auto-dismiss any earlier read of this file (content is now stale).
+		// Skip if the read has a summarize+keepLines decision — the kept lines are a small
+		// subset (like baseline's full stale content) and preserve context the model needs.
 		const previousRead = readFileToolCallIds.get(path);
 		if (previousRead) {
-			applyHeuristicDismiss(previousRead.id, `stale after edit of ${path}`);
-			readFileToolCallIds.delete(path);
+			const prevDecision = decisions.get(previousRead.id);
+			const hasKeepLines = prevDecision?.action === "summarize" && prevDecision.keepLines?.length;
+			if (!hasKeepLines) {
+				applyHeuristicDismiss(previousRead.id, `stale after edit of ${path}`);
+				readFileToolCallIds.delete(path);
+			}
 		}
 	});
 
@@ -260,12 +297,18 @@ export default function piSift(pi: ExtensionAPI) {
 		const path = isObject(event.input) ? getFilePathFromInput(event.input) : undefined;
 
 		// Auto-dismiss old read when a file is re-read, but only if the old read was full-file.
+		// Skip if the old read already has a summarize+keepLines decision — that content is
+		// already compressed and the kept lines are valuable, so don't throw them away.
 		// Only applies to "read" tool — grep/bash paths are search directories, not file content.
 		// Runs before the size threshold — dismissing the old read doesn't depend on the new read's size.
 		if (path && event.toolName === "read") {
 			const previous = readFileToolCallIds.get(path);
 			if (previous?.isFullRead) {
-				applyHeuristicDismiss(previous.id, `superseded by re-read of ${path}`);
+				const prevDecision = decisions.get(previous.id);
+				const hasKeepLines = prevDecision?.action === "summarize" && prevDecision.keepLines?.length;
+				if (!hasKeepLines) {
+					applyHeuristicDismiss(previous.id, `superseded by re-read of ${path}`);
+				}
 			}
 		}
 
@@ -295,7 +338,9 @@ export default function piSift(pi: ExtensionAPI) {
 		console.error(`[pi-sift] marking tool_result id=${event.toolCallId} size=${size}`);
 
 		const text = extractText(event.content);
-		return { content: [{ type: "text" as const, text: marker + text }] };
+		// Add line numbers so the model can make accurate keepLines selections
+		const numbered = text.split("\n").map((line, i) => `${i + 1}\t${line}`).join("\n");
+		return { content: [{ type: "text" as const, text: marker + numbered }] };
 	});
 
 	// Parse and strip <context_lens> blocks from assistant messages, persist decisions.
@@ -313,7 +358,11 @@ export default function piSift(pi: ExtensionAPI) {
 			};
 			decisions.set(canonicalId, normalized);
 			pendingDecisions.delete(canonicalId);
-			if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, normalized);
+			if (!config.dryRun) {
+				// Persist keepLines but not cachedReplacement (runtime-only cache)
+				const { cachedReplacement: _, ...persisted } = normalized;
+				pi.appendEntry(CUSTOM_ENTRY_TYPE, persisted);
+			}
 		};
 
 		const content = event.message.content;
@@ -417,16 +466,35 @@ export default function piSift(pi: ExtensionAPI) {
 			const decision = decisions.get(canonicalToolCallId(toolCallId));
 			if (!decision || decision.action === "keep") continue;
 
-			const summary =
-				decision.action === "dismiss"
-					? `[pi-sift dismissed: ${decision.summary || "not relevant"}]`
-					: decision.summary || "[pi-sift: summarized]";
+			let replacement: string;
+			if (decision.action === "dismiss") {
+				replacement = `[pi-sift dismissed: ${decision.summary || "not relevant"}]`;
+			} else if (decision.cachedReplacement) {
+				replacement = decision.cachedReplacement;
+			} else {
+				const baseSummary = decision.summary || "[pi-sift: summarized]";
+				if (decision.keepLines && decision.keepLines.length > 0) {
+					let originalText = extractText(msg.content);
+					// Strip the CONTEXT_LENS_SCORE marker so line numbers match the original file
+					const markerEnd = originalText.indexOf(MARKER_PREFIX) === 0
+						? originalText.indexOf("\n\n", MARKER_PREFIX.length)
+						: -1;
+					if (markerEnd !== -1) originalText = originalText.slice(markerEnd + 2);
+					const keptText = extractLineRange(originalText, decision.keepLines);
+					replacement = keptText
+						? `${baseSummary}\n\n--- kept lines ---\n${keptText}`
+						: baseSummary;
+				} else {
+					replacement = baseSummary;
+				}
+				decision.cachedReplacement = replacement;
+			}
 
 			const originalLength = extractTextLength(msg.content);
-			if (originalLength <= summary.length) continue;
+			if (originalLength <= replacement.length) continue;
 
-			msg.content = [{ type: "text", text: summary }];
-			totalCharsSaved += Math.max(0, originalLength - summary.length);
+			msg.content = [{ type: "text", text: replacement }];
+			totalCharsSaved += Math.max(0, originalLength - replacement.length);
 			decisionsAppliedThisPass = true;
 			changed = true;
 		}
@@ -437,4 +505,4 @@ export default function piSift(pi: ExtensionAPI) {
 }
 
 // Re-export helpers for testing
-export { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction };
+export { extractTextLength, extractLineRange, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction };

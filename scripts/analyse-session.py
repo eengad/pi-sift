@@ -77,9 +77,14 @@ def analyse(entries):
                             or args.get("filePath")
                             or args.get("command", "")[:60]
                         )
-                        offset = args.get("offset", "")
-                        limit = args.get("limit", "")
-                        extra = f" lines {offset}-{offset + limit}" if offset else ""
+                        offset = args.get("offset")
+                        limit = args.get("limit")
+                        if offset and limit:
+                            extra = f" lines {offset}-{int(offset) + int(limit)}"
+                        elif offset:
+                            extra = f" @{offset}"
+                        else:
+                            extra = ""
                         tools.append(f"{b.get('name', '')}: {path}{extra}")
                     if b.get("type") == "text":
                         for match in re.finditer(
