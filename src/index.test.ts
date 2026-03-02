@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText } from "./index.js";
+import { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction } from "./index.js";
 
 describe("extractTextLength", () => {
 	it("handles plain string", () => { assert.equal(extractTextLength("hello"), 5); });
@@ -285,5 +285,195 @@ describe("Mode A inline marker flow", () => {
 		}
 		assert.equal(ctxResult, undefined);
 		assert.equal((contextMsgs[0] as any).content[0].text.length, 6000);
+	});
+});
+
+// Helper to set up a fresh piSift instance with fakePi
+const setupPiSift = async () => {
+	const { default: piSift } = await import("./index.js");
+	const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+	const appended: Array<{ type: string; data: unknown }> = [];
+	const fakePi = {
+		on(event: string, handler: (...args: unknown[]) => unknown) {
+			if (!handlers.has(event)) handlers.set(event, []);
+			handlers.get(event)!.push(handler);
+		},
+		registerCommand() {},
+		appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
+	};
+	piSift(fakePi as any);
+	// session_start to initialize
+	for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+	return { handlers, appended };
+};
+
+const fireToolResult = (handlers: Map<string, Array<(...args: unknown[]) => unknown>>, opts: { toolCallId: string; toolName: string; path: string; size: number }) => {
+	let result: any;
+	for (const h of handlers.get("tool_result") || []) {
+		result = h({
+			type: "tool_result",
+			toolCallId: opts.toolCallId,
+			toolName: opts.toolName,
+			input: { path: opts.path },
+			content: [{ type: "text", text: "x".repeat(opts.size) }],
+			isError: false,
+		}, {});
+	}
+	return result;
+};
+
+const fireToolResultWithOffset = (handlers: Map<string, Array<(...args: unknown[]) => unknown>>, opts: { toolCallId: string; toolName: string; path: string; size: number; offset: number }) => {
+	let result: any;
+	for (const h of handlers.get("tool_result") || []) {
+		result = h({
+			type: "tool_result",
+			toolCallId: opts.toolCallId,
+			toolName: opts.toolName,
+			input: { path: opts.path, offset: opts.offset },
+			content: [{ type: "text", text: "x".repeat(opts.size) }],
+			isError: false,
+		}, {});
+	}
+	return result;
+};
+
+const fireToolExecutionStart = (handlers: Map<string, Array<(...args: unknown[]) => unknown>>, opts: { toolName: string; path: string }) => {
+	for (const h of handlers.get("tool_execution_start") || []) {
+		h({ toolName: opts.toolName, args: { path: opts.path } }, {});
+	}
+};
+
+describe("Heuristic context pruning", () => {
+	it("re-read dismisses previous read", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// First read of file A
+		fireToolResult(handlers, { toolCallId: "tc-read1", toolName: "read", path: "/src/big.py", size: 5000 });
+		assert.equal(appended.length, 0, "no heuristic dismiss yet");
+
+		// Re-read of file A
+		const result = fireToolResult(handlers, { toolCallId: "tc-read2", toolName: "read", path: "/src/big.py", size: 5000 });
+
+		// Old read should be dismissed
+		assert.equal(appended.length, 1, "heuristic dismiss should fire");
+		const decision = appended[0].data as any;
+		assert.equal(decision.toolCallId, "tc-read1");
+		assert.equal(decision.action, "dismiss");
+		assert.ok(decision.summary.includes("superseded by re-read"));
+
+		// New read should still be marked for scoring (returns content with marker)
+		assert.ok(result, "new read should be marked for scoring");
+		assert.ok(result.content[0].text.includes("[CONTEXT_LENS_SCORE:tc-read2]"));
+	});
+
+	it("targeted re-read dismisses full read", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Full read
+		fireToolResult(handlers, { toolCallId: "tc-full", toolName: "read", path: "/src/large.py", size: 10000 });
+
+		// Targeted re-read (same path, with offset — simulates partial read)
+		fireToolResultWithOffset(handlers, { toolCallId: "tc-targeted", toolName: "read", path: "/src/large.py", size: 3000, offset: 100 });
+
+		// Full read should be dismissed
+		assert.equal(appended.length, 1);
+		const decision = appended[0].data as any;
+		assert.equal(decision.toolCallId, "tc-full");
+		assert.equal(decision.action, "dismiss");
+		assert.ok(decision.summary.includes("superseded by re-read"));
+	});
+
+	it("offset reads of same file do not dismiss each other", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Two offset reads of the same file — different sections
+		fireToolResultWithOffset(handlers, { toolCallId: "tc-section1", toolName: "read", path: "/src/big.py", size: 3000, offset: 100 });
+		fireToolResultWithOffset(handlers, { toolCallId: "tc-section2", toolName: "read", path: "/src/big.py", size: 3000, offset: 500 });
+
+		// Neither should be dismissed — they may be complementary
+		assert.equal(appended.length, 0, "offset reads should not dismiss each other");
+	});
+
+	it("edit dismisses previous read", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file A
+		fireToolResult(handlers, { toolCallId: "tc-readA", toolName: "read", path: "/src/component.py", size: 8000 });
+
+		// Edit file A
+		fireToolExecutionStart(handlers, { toolName: "edit", path: "/src/component.py" });
+
+		// Read should be dismissed as stale
+		assert.equal(appended.length, 1);
+		const decision = appended[0].data as any;
+		assert.equal(decision.toolCallId, "tc-readA");
+		assert.equal(decision.action, "dismiss");
+		assert.ok(decision.summary.includes("stale after edit"));
+	});
+
+	it("fresh read after edit is scored normally", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read → edit (dismisses read) → read again
+		fireToolResult(handlers, { toolCallId: "tc-r1", toolName: "read", path: "/src/file.py", size: 5000 });
+		fireToolExecutionStart(handlers, { toolName: "edit", path: "/src/file.py" });
+		assert.equal(appended.length, 1, "first read dismissed by edit");
+
+		// Advance past the edited-file protection window (default 4 turns)
+		for (const h of handlers.get("turn_start") || []) h({ turnIndex: 10 });
+
+		// Fresh read after edit should be scored (returns marker)
+		const result = fireToolResult(handlers, { toolCallId: "tc-r2", toolName: "read", path: "/src/file.py", size: 5000 });
+		assert.ok(result, "fresh read should be marked for scoring");
+		assert.ok(result.content[0].text.includes("[CONTEXT_LENS_SCORE:tc-r2]"));
+		// No additional heuristic dismiss (only the one from the edit)
+		assert.equal(appended.length, 1, "no extra heuristic dismiss for fresh read");
+	});
+
+	it("scoring prompt contains bias text", () => {
+		const instruction = buildScoringInstruction([
+			{ toolCallId: "tc-1", toolName: "read", size: 5000, path: "/test.py", assistantMessagesSinceMarked: 0, instructionInjected: false },
+		]);
+		assert.ok(instruction.includes("Prefer summarize or dismiss"), "scoring prompt should contain bias text");
+		assert.ok(instruction.includes("re-reading is cheap"), "scoring prompt should mention re-reading cost");
+	});
+
+	it("heuristic dismiss overrides existing keep decision", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file A
+		fireToolResult(handlers, { toolCallId: "tc-decided", toolName: "read", path: "/src/decided.py", size: 5000 });
+
+		// Simulate model deciding to keep it via message_end
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-decided","action":"keep"}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+		assert.equal(appended.length, 1, "model decision persisted");
+		assert.equal((appended[0].data as any).action, "keep");
+
+		// Re-read the same file — heuristic SHOULD override the keep with dismiss
+		fireToolResult(handlers, { toolCallId: "tc-reread", toolName: "read", path: "/src/decided.py", size: 5000 });
+
+		const dismissDecisions = appended.filter((a) => (a.data as any).toolCallId === "tc-decided" && (a.data as any).action === "dismiss");
+		assert.equal(dismissDecisions.length, 1, "heuristic should override keep with dismiss");
+	});
+
+	it("heuristic dismiss skips already-dismissed toolCallId", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file A twice — first read gets heuristic-dismissed
+		fireToolResult(handlers, { toolCallId: "tc-first", toolName: "read", path: "/src/file.py", size: 5000 });
+		fireToolResult(handlers, { toolCallId: "tc-second", toolName: "read", path: "/src/file.py", size: 5000 });
+		assert.equal(appended.length, 1, "first read dismissed");
+		assert.equal((appended[0].data as any).action, "dismiss");
+
+		// Third read — tc-second should be dismissed, but tc-first should NOT get a second dismiss
+		fireToolResult(handlers, { toolCallId: "tc-third", toolName: "read", path: "/src/file.py", size: 5000 });
+		assert.equal(appended.length, 2, "only tc-second dismissed, tc-first not re-dismissed");
+		assert.equal((appended[1].data as any).toolCallId, "tc-second");
 	});
 });

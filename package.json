@@ -11,7 +11,8 @@
     "test": "tsx --test src/index.test.ts src/validation.test.ts",
     "validate": "npm run check && npm run test",
     "validate:real": "./scripts/validate-real-pi.sh",
-    "benchmark:swe-pipeline-ab": "./scripts/benchmark-swe-pipeline-ab.sh"
+    "benchmark:swe-pipeline-ab": "./scripts/benchmark-swe-pipeline-ab.sh",
+    "analyse-session": "python3 ./scripts/analyse-session.py"
   },
   "keywords": [
     "pi",

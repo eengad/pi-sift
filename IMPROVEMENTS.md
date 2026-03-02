@@ -3,14 +3,25 @@
 ## ~~Rename to pi-sift~~ ✅ Done
 Renamed from `pi-context-lens`. Internal protocol strings (`<context_lens>`, `context_lens_decision`) kept as-is for session compatibility.
 
+## ~~Auto-dismiss full-file reads on re-read~~ ✅ Done
+When the agent re-reads a file, the old full-file read is dismissed automatically. Only applies to `read` tool (not grep/bash). Offset reads don't dismiss each other since they may be complementary sections. Small results (below `minCharsToScore`) are not tracked.
+
+## ~~Auto-dismiss reads after the file is edited~~ ✅ Done
+When the agent edits a file, any earlier read of that file is dismissed as stale. Overrides existing model decisions (e.g. "keep") since staleness is deterministic.
+
+## ~~Bias scoring toward summarize/dismiss~~ ✅ Done
+Added prompt text: "Prefer summarize or dismiss — keeping costs tokens every turn; re-reading is cheap." The model still tends toward keep in practice — may need stronger intervention (e.g. removing keep as an option).
+
+## ~~Raise minCharsToScore threshold~~ ✅ Done
+Raised from 2000 to 5000. Small targeted reads (agent already curated the range via grep) have marginal savings that don't justify scoring overhead.
+
+---
+
 ## Remove inline marker from tool_result hook
-The `[CONTEXT_LENS_SCORE:id]` marker prepended in the `tool_result` hook (`src/index.ts` line 257) may be redundant. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them. Removing the marker would reduce context size. Blocked on having a reliable way to verify it doesn't degrade scoring accuracy.
+The `[CONTEXT_LENS_SCORE:id]` marker prepended in the `tool_result` hook may be redundant. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them. Removing the marker would reduce context size. Blocked on having a reliable way to verify it doesn't degrade scoring accuracy.
 
 ## Consider scoring error results
-Currently errors are unconditionally skipped (`src/index.ts` line 229). But long stack traces / compilation errors could benefit from summarization — the model doesn't always need the full output to debug. Also, after debugging, the error stays in context until compaction. Different behavior to design than normal results — needs its own approach.
-
-## Auto-dismiss older read on re-read
-Currently re-reads are skipped for scoring (`src/index.ts` line 238), but the older read result stays in context at full size. On re-read, the extension could automatically dismiss/summarize the previous result for that path, since the new content supersedes it.
+Currently errors are unconditionally skipped. But long stack traces / compilation errors could benefit from summarization — the model doesn't always need the full output to debug. Also, after debugging, the error stays in context until compaction. Different behavior to design than normal results — needs its own approach.
 
 ## Edited files may have been read before editing
 Recently edited files may already be covered by re-reads and maybe don't need a separate condition to be skipped from scoring.
@@ -40,7 +51,7 @@ This is a simpler first step for the "Consider scoring error results" item above
 Implementation: track errored tool calls with their turn number. In the `context` handler, for errors older than N turns, replace the input content with `[input removed — error tool call from N turns ago]`.
 
 ### General dedup (same tool + same args → keep only latest)
-Extend the current `seenFilePaths` tracking (which only covers `read` paths) to a general "same tool name + same parameters" signature. When the same tool call is made with identical arguments, keep only the most recent result and dismiss all earlier ones.
+When the same tool call is made with identical arguments, keep only the most recent result and dismiss all earlier ones.
 
 Covers cases the current re-read logic misses:
 - Running `npm test` twice (before and after a fix)
