@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractTextLength, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction } from "./index.js";
+import { extractTextLength, extractLineRange, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction } from "./index.js";
 
 describe("extractTextLength", () => {
 	it("handles plain string", () => { assert.equal(extractTextLength("hello"), 5); });
@@ -288,6 +288,222 @@ describe("Mode A inline marker flow", () => {
 	});
 });
 
+describe("extractLineRange", () => {
+	const plainText = [
+		"function hello() {",
+		"  console.log('hi');",
+		"}",
+		"",
+		"function world() {",
+		"  return 42;",
+		"}",
+	].join("\n");
+
+	it("extracts a single range", () => {
+		const result = extractLineRange(plainText, [[1, 3]]);
+		assert.ok(result.includes("function hello()"));
+		assert.ok(result.includes("console.log"));
+		assert.ok(result.includes("}"));
+		assert.ok(!result.includes("function world()"));
+	});
+
+	it("extracts multiple ranges", () => {
+		const result = extractLineRange(plainText, [[1, 1], [5, 7]]);
+		assert.ok(result.includes("function hello()"));
+		assert.ok(!result.includes("console.log"));
+		assert.ok(result.includes("function world()"));
+		assert.ok(result.includes("return 42"));
+	});
+
+	it("returns empty string for out-of-range lines", () => {
+		assert.equal(extractLineRange(plainText, [[100, 200]]), "");
+	});
+
+	it("handles single-line text", () => {
+		assert.equal(extractLineRange("only line", [[1, 1]]), "only line");
+	});
+
+	it("clamps to end of text", () => {
+		const result = extractLineRange(plainText, [[6, 100]]);
+		assert.ok(result.includes("return 42"));
+		assert.ok(result.includes("}"));
+		assert.equal(result.split("\n").length, 2);
+	});
+});
+
+describe("parseDecisionPayload keepLines validation", () => {
+	it("accepts valid keepLines", () => {
+		const d = parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", summary: "Short", keepLines: [[1, 10], [20, 30]] });
+		assert.ok(d);
+		assert.deepEqual(d.keepLines, [[1, 10], [20, 30]]);
+	});
+
+	it("accepts summarize without keepLines", () => {
+		const d = parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", summary: "Short" });
+		assert.ok(d);
+		assert.equal(d.keepLines, undefined);
+	});
+
+	it("rejects non-array keepLines", () => {
+		assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", keepLines: "bad" }), null);
+	});
+
+	it("rejects keepLines with non-tuple items", () => {
+		assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", keepLines: [[1]] }), null);
+	});
+
+	it("rejects keepLines with non-number values", () => {
+		assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", keepLines: [["a", "b"]] }), null);
+	});
+
+	it("rejects keepLines where start < 1", () => {
+		assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", keepLines: [[0, 5]] }), null);
+	});
+
+	it("rejects keepLines where end < start", () => {
+		assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", keepLines: [[10, 5]] }), null);
+	});
+});
+
+describe("keepLines in summarize flow", () => {
+	it("summarize with keepLines preserves correct lines", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const appended: Array<{ type: string; data: unknown }> = [];
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
+		};
+		piSift(fakePi as any);
+
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		// Build plain text content (large enough to score)
+		const plainLines: string[] = [];
+		for (let i = 1; i <= 200; i++) {
+			plainLines.push(`line ${i} content here padding${"x".repeat(30)}`);
+		}
+		const bigContent = plainLines.join("\n");
+
+		// Fire tool_result to register it
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				type: "tool_result", toolCallId: "tc-kl1", toolName: "read",
+				input: { path: "/src/big.py" }, content: [{ type: "text", text: bigContent }], isError: false,
+			}, {});
+		}
+
+		// Model emits summarize with keepLines
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-kl1","action":"summarize","summary":"200-line Python file with utils.","keepLines":[[1,3],[100,102]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+
+		assert.equal(appended.length, 1);
+		const persisted = appended[0].data as any;
+		assert.deepEqual(persisted.keepLines, [[1, 3], [100, 102]]);
+		assert.equal(persisted.cachedReplacement, undefined, "cachedReplacement must not be persisted");
+
+		// Apply via context hook — content has marker prefix like real tool results
+		const markerContent = `[CONTEXT_LENS_SCORE:tc-kl1] This result is ${bigContent.length} chars.\n\n${bigContent}`;
+		const contextMsgs = [
+			{ role: "toolResult", toolCallId: "tc-kl1", content: [{ type: "text", text: markerContent }] },
+			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
+		];
+		let ctxResult: any;
+		for (const h of handlers.get("context") || []) {
+			ctxResult = h({ messages: contextMsgs }, {});
+		}
+		assert.ok(ctxResult);
+		const replaced = ctxResult.messages[0].content[0].text;
+		assert.ok(replaced.includes("200-line Python file with utils."), "summary present");
+		assert.ok(replaced.includes("--- kept lines ---"), "kept lines section present");
+		assert.ok(replaced.includes("line 1 content"), "line 1 preserved");
+		assert.ok(replaced.includes("line 3 content"), "line 3 preserved");
+		assert.ok(replaced.includes("line 100 content"), "line 100 preserved");
+		assert.ok(replaced.includes("line 102 content"), "line 102 preserved");
+		assert.ok(!replaced.includes("line 50 content"), "line 50 not preserved");
+	});
+
+	it("cachedReplacement is reused on second context pass", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const appended: Array<{ type: string; data: unknown }> = [];
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
+		};
+		piSift(fakePi as any);
+
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		const plainLines: string[] = [];
+		for (let i = 1; i <= 200; i++) {
+			plainLines.push(`line ${i} of file${"x".repeat(30)}`);
+		}
+		const bigContent = plainLines.join("\n");
+
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				type: "tool_result", toolCallId: "tc-cache1", toolName: "read",
+				input: { path: "/src/cached.py" }, content: [{ type: "text", text: bigContent }], isError: false,
+			}, {});
+		}
+
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-cache1","action":"summarize","summary":"Cached file.","keepLines":[[5,5]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+
+		// First context pass - builds cachedReplacement (with marker prefix like real tool results)
+		const markerContent = `[CONTEXT_LENS_SCORE:tc-cache1] This result is ${bigContent.length} chars.\n\n${bigContent}`;
+		const msgs1 = [
+			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: markerContent }] },
+			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
+		];
+		for (const h of handlers.get("context") || []) {
+			h({ messages: msgs1 }, {});
+		}
+		const firstResult = msgs1[0].content[0].text;
+
+		// Second context pass - should use cachedReplacement. Use fresh big content with marker.
+		const msgs2 = [
+			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: markerContent }] },
+			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
+		];
+		for (const h of handlers.get("context") || []) {
+			h({ messages: msgs2 }, {});
+		}
+		const secondResult = msgs2[0].content[0].text;
+
+		assert.equal(firstResult, secondResult, "cachedReplacement should produce identical output");
+	});
+});
+
+describe("buildScoringInstruction mentions keepLines", () => {
+	it("scoring prompt mentions keepLines", () => {
+		const instruction = buildScoringInstruction([
+			{ toolCallId: "tc-1", toolName: "read", size: 5000, path: "/test.py", assistantMessagesSinceMarked: 0, instructionInjected: false },
+		]);
+		assert.ok(instruction.includes("keepLines"), "scoring prompt should mention keepLines");
+		assert.ok(instruction.includes("[start,end]"), "scoring prompt should describe keepLines format");
+	});
+});
+
 // Helper to set up a fresh piSift instance with fakePi
 const setupPiSift = async () => {
 	const { default: piSift } = await import("./index.js");
@@ -394,6 +610,55 @@ describe("Heuristic context pruning", () => {
 		assert.equal(appended.length, 0, "offset reads should not dismiss each other");
 	});
 
+	it("re-read preserves summarize+keepLines decision", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file
+		fireToolResult(handlers, { toolCallId: "tc-kept", toolName: "read", path: "/src/kept.py", size: 8000 });
+
+		// Model summarizes with keepLines
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-kept","action":"summarize","summary":"Module with utils.","keepLines":[[10,20]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+		assert.equal(appended.length, 1);
+		assert.equal((appended[0].data as any).action, "summarize");
+
+		// Re-read same file (e.g. model wants a different section)
+		fireToolResult(handlers, { toolCallId: "tc-reread-kept", toolName: "read", path: "/src/kept.py", size: 5000 });
+
+		// Should NOT dismiss the keepLines decision
+		const dismisses = appended.filter((a) => (a.data as any).toolCallId === "tc-kept" && (a.data as any).action === "dismiss");
+		assert.equal(dismisses.length, 0, "summarize+keepLines should not be dismissed by re-read");
+	});
+
+	it("re-read still dismisses plain summarize without keepLines", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file
+		fireToolResult(handlers, { toolCallId: "tc-plain", toolName: "read", path: "/src/plain.py", size: 8000 });
+
+		// Model summarizes without keepLines
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-plain","action":"summarize","summary":"Module with utils."}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+		assert.equal(appended.length, 1);
+
+		// Re-read same file
+		fireToolResult(handlers, { toolCallId: "tc-reread-plain", toolName: "read", path: "/src/plain.py", size: 5000 });
+
+		// SHOULD dismiss — no keepLines to preserve
+		const dismisses = appended.filter((a) => (a.data as any).toolCallId === "tc-plain" && (a.data as any).action === "dismiss");
+		assert.equal(dismisses.length, 1, "plain summarize should still be dismissed by re-read");
+	});
+
 	it("edit dismisses previous read", async () => {
 		const { handlers, appended } = await setupPiSift();
 
@@ -409,6 +674,30 @@ describe("Heuristic context pruning", () => {
 		assert.equal(decision.toolCallId, "tc-readA");
 		assert.equal(decision.action, "dismiss");
 		assert.ok(decision.summary.includes("stale after edit"));
+	});
+
+	it("edit preserves summarize+keepLines decision", async () => {
+		const { handlers, appended } = await setupPiSift();
+
+		// Read file
+		fireToolResult(handlers, { toolCallId: "tc-edit-kept", toolName: "read", path: "/src/edit-kept.py", size: 8000 });
+
+		// Model summarizes with keepLines
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-edit-kept","action":"summarize","summary":"Module.","keepLines":[[10,20]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+		assert.equal(appended.length, 1);
+
+		// Edit the same file
+		fireToolExecutionStart(handlers, { toolName: "edit", path: "/src/edit-kept.py" });
+
+		// Should NOT dismiss — keepLines are still useful context
+		const dismisses = appended.filter((a) => (a.data as any).toolCallId === "tc-edit-kept" && (a.data as any).action === "dismiss");
+		assert.equal(dismisses.length, 0, "summarize+keepLines should not be dismissed by edit");
 	});
 
 	it("fresh read after edit is scored normally", async () => {
