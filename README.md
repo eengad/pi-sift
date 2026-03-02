@@ -1,79 +1,69 @@
 # pi-sift
 
-A Pi Coding Agent extension that reduces context bloat by having the model score large tool results for relevance and replacing low-value content with concise summaries.
+A [Pi Coding Agent](https://github.com/nicepkg/pi-coding-agent) extension that prevents large and unnecessary tool results from polluting the context. The model scores large results for relevance and replaces low-value content with concise summaries, optionally preserving critical line ranges verbatim (`keepLines`).
 
-Current status: **initial implementation (Mode A / piggyback) scaffold**.
+## How it works
+
+1. When a tool result exceeds a size threshold, pi-sift appends a scoring prompt asking the model to decide: **keep**, **summarize**, or **dismiss**.
+2. On summarize, the model can specify `keepLines` — line ranges to preserve verbatim while compressing the rest.
+3. Before each API call, the context hook replaces scored content with the summary + kept lines.
+4. Heuristic dismiss auto-removes stale reads when files are re-read or edited, but preserves summarize+keepLines decisions.
 
 ## Install
+
+```bash
+pi install pi-sift
+```
+
+Or from source:
 
 ```bash
 pi install https://github.com/eengad/pi-sift
 ```
 
-- Design: [`DESIGN.md`](./DESIGN.md)
-- Improvement ideas: [`IMPROVEMENTS.md`](./IMPROVEMENTS.md)
-- Source: [`src/index.ts`](./src/index.ts)
+## Benchmark results (SWE-ReBench, N=1 per task)
+
+| Task | Baseline tokens | Extension tokens | Δ tokens | Δ cost | Δ latency |
+|---|---|---|---|---|---|
+| pennylane-7671 | 91k | 69k | **-25%** | **-20%** | **-58%** |
+| haystack-9527 | 821k | 135k | **-83%** | **-41%** | **-72%** |
+| stellarphot-519 | 2,593k | 2,619k | +1% | +20% | +6% |
+| stellarphot-526 | 67k | 53k | **-20%** | +11% | **-12%** |
+
+Resolution unchanged (1/4 for both). Single runs — variance is possible, especially on task 3 (98 turns). Full results in [`benchmark-keeplines-results.md`](./benchmark-keeplines-results.md).
 
 ## Local development
 
 ```bash
 npm install
-npm run check
 npm run build
+npm test
 ```
 
-## Validation
+## A/B benchmark
 
-Run end-to-end phase-1 validation (typecheck + unit + flow tests):
-
-```bash
-npm run validate
-```
-
-Run a **real Pi runtime** integration validation (requires authenticated `pi` model access):
-
-```bash
-npm run validate:real
-```
-
-Optional model override:
-
-```bash
-PI_VALIDATE_MODEL=openai-codex/gpt-5.3-codex npm run validate:real
-```
-
-## A/B benchmark with SWE-ReBench verification pipeline (patch correctness)
-
-Run baseline vs extension and evaluate each generated patch with SWE_ReBench's Docker verification flow (`DockerEnvironment.verify_solution`):
+Run baseline vs extension on SWE-ReBench tasks with Docker verification:
 
 ```bash
 npm run benchmark:swe-pipeline-ab
 ```
 
-Defaults: model `anthropic/claude-opus-4-6`, dataset `nebius/SWE-rebench-leaderboard`, task 0. Override with env vars:
+Override defaults with env vars:
 
 ```bash
-PI_BENCH_MODEL=anthropic/claude-opus-4-6 \
-PI_BENCH_DATASET=nebius/SWE-rebench-leaderboard \
 PI_BENCH_TASKS=0,1,2 \
 PI_BENCH_CONFIGS=extension \
-PI_BENCH_RUNS=1 \
-PI_BENCH_TIMEOUT_SEC=900 \
 PI_BENCH_KEEP_WORKDIR=1 \
 npm run benchmark:swe-pipeline-ab
 ```
 
-`PI_BENCH_CONFIGS` can be `baseline,extension` (default, A/B comparison) or `extension` (skip baseline to save time/cost when iterating on the extension).
-
-### Analyse session logs
-
-After a benchmark run with `PI_BENCH_KEEP_WORKDIR=1`, inspect the extension's decisions and timeline:
+Analyse session logs after a run:
 
 ```bash
 npm run analyse-session -- /tmp/tmp.XXX/task_0/extension_run1/sessions/*.jsonl
 ```
 
-Notes:
-- Requires Docker running locally.
-- By default it clones `DivyeshJayswal/SWE_ReBench` into the workdir for verifier code.
-- This benchmark reports both efficiency metrics (latency/tokens/cost) and correctness (`resolved`).
+## Links
+
+- Design: [`DESIGN.md`](./DESIGN.md)
+- Improvement ideas: [`IMPROVEMENTS.md`](./IMPROVEMENTS.md)
