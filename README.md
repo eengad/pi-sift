@@ -21,7 +21,7 @@ Or from source:
 pi install https://github.com/eengad/pi-sift
 ```
 
-## Benchmark results (SWE-ReBench, N=1 per task)
+## Benchmark results (SWE-ReBench, claude-opus-4-6, N=1 per task)
 
 | Task | Baseline tokens | Extension tokens | Δ tokens | Δ cost | Δ latency |
 |---|---|---|---|---|---|
