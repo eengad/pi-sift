@@ -17,6 +17,13 @@ Raised from 2000 to 5000. Small targeted reads (agent already curated the range 
 
 ---
 
+## Fork-based A/B benchmarking
+The current independent-runs A/B approach has high variance (model runs can differ 20-30% in tokens
+with no changes). A fork approach would snapshot the session at the first large tool result, then run
+one branch with compression and one without. This isolates the decision's actual impact rather than
+conflating it with run-to-run variance. Non-trivial to implement: requires injecting the full
+uncompressed tool result back into the baseline branch at the fork point.
+
 ## Remove inline marker from tool_result hook
 The `[CONTEXT_LENS_SCORE:id]` marker prepended in the `tool_result` hook may be redundant. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them. Removing the marker would reduce context size. Blocked on having a reliable way to verify it doesn't degrade scoring accuracy.
 

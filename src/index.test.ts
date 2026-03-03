@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { extractTextLength, extractLineRange, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction } from "./index.js";
+import { extractTextLength, extractLineRange, stripLineNumbers, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction } from "./index.js";
 
 describe("extractTextLength", () => {
 	it("handles plain string", () => { assert.equal(extractTextLength("hello"), 5); });
@@ -19,7 +19,7 @@ describe("extractText", () => {
 describe("parseDecisionPayload", () => {
 	it("parses valid keep", () => { const d = parseDecisionPayload({ toolCallId: "tc-1", action: "keep" }); assert.ok(d); assert.equal(d.action, "keep"); });
 	it("parses valid summarize", () => { const d = parseDecisionPayload({ toolCallId: "tc-2", action: "summarize", summary: "Short" }); assert.ok(d); assert.equal(d.summary, "Short"); });
-	it("parses valid dismiss", () => { const d = parseDecisionPayload({ toolCallId: "tc-3", action: "dismiss", summary: "Not relevant" }); assert.ok(d); assert.equal(d.action, "dismiss"); });
+	it("rejects dismiss action (model cannot dismiss)", () => { assert.equal(parseDecisionPayload({ toolCallId: "tc-3", action: "dismiss", summary: "Not relevant" }), null); });
 	it("rejects missing toolCallId", () => { assert.equal(parseDecisionPayload({ action: "keep" }), null); });
 	it("rejects invalid action", () => { assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "remove" }), null); });
 	it("rejects non-string summary", () => { assert.equal(parseDecisionPayload({ toolCallId: "tc-1", action: "summarize", summary: 123 }), null); });
@@ -33,7 +33,7 @@ describe("parseDecisionsFromText", () => {
 		assert.equal(d[0].action, "keep");
 	});
 	it("parses multiple blocks", () => {
-		const d = parseDecisionsFromText('<context_lens>{"toolCallId":"a","action":"keep"}</context_lens><context_lens>{"toolCallId":"b","action":"dismiss","summary":"x"}</context_lens>');
+		const d = parseDecisionsFromText('<context_lens>{"toolCallId":"a","action":"keep"}</context_lens><context_lens>{"toolCallId":"b","action":"summarize","summary":"x"}</context_lens>');
 		assert.equal(d.length, 2);
 	});
 	it("ignores malformed JSON", () => { assert.equal(parseDecisionsFromText("<context_lens>not json</context_lens>").length, 0); });
@@ -158,7 +158,7 @@ describe("Mode A inline marker flow", () => {
 			role: "assistant",
 			content: [
 				{ type: "thinking", thinking: "Let me analyze this..." },
-				{ type: "text", text: '<context_lens>{"toolCallId":"tc-5","action":"dismiss","summary":"irrelevant"}</context_lens>' },
+				{ type: "text", text: '<context_lens>{"toolCallId":"tc-5","action":"summarize","summary":"irrelevant"}</context_lens>' },
 				{ type: "thinking", thinking: "Now continuing..." },
 				{ type: "text", text: "Final answer here." },
 			],
@@ -169,7 +169,7 @@ describe("Mode A inline marker flow", () => {
 			h({ message: thinkingMsg }, {});
 		}
 		assert.equal(appended.length, 1, "decision parsed and persisted");
-		assert.equal((appended[0].data as any).action, "dismiss");
+		assert.equal((appended[0].data as any).action, "summarize");
 		// Content must be completely unmodified
 		assert.equal(thinkingMsg.content.length, 4, "all 4 blocks preserved");
 		assert.equal(thinkingMsg.content[0].type, "thinking");
@@ -285,6 +285,21 @@ describe("Mode A inline marker flow", () => {
 		}
 		assert.equal(ctxResult, undefined);
 		assert.equal((contextMsgs[0] as any).content[0].text.length, 6000);
+	});
+});
+
+describe("stripLineNumbers", () => {
+	it("strips N\\t prefixes", () => {
+		const input = "1\thello\n2\tworld\n3\t";
+		assert.equal(stripLineNumbers(input), "hello\nworld\n");
+	});
+	it("leaves plain lines untouched", () => {
+		const input = "hello\nworld";
+		assert.equal(stripLineNumbers(input), "hello\nworld");
+	});
+	it("leaves non-numeric prefixes untouched", () => {
+		const input = "abc\thello\n2\tworld";
+		assert.equal(stripLineNumbers(input), "abc\thello\nworld");
 	});
 });
 
@@ -424,12 +439,57 @@ describe("keepLines in summarize flow", () => {
 		assert.ok(ctxResult);
 		const replaced = ctxResult.messages[0].content[0].text;
 		assert.ok(replaced.includes("200-line Python file with utils."), "summary present");
-		assert.ok(replaced.includes("--- kept lines ---"), "kept lines section present");
+		assert.ok(replaced.includes("--- kept lines 1-3 ---"), "kept lines 1-3 section present");
+		assert.ok(replaced.includes("--- kept lines 100-102 ---"), "kept lines 100-102 section present");
 		assert.ok(replaced.includes("line 1 content"), "line 1 preserved");
 		assert.ok(replaced.includes("line 3 content"), "line 3 preserved");
 		assert.ok(replaced.includes("line 100 content"), "line 100 preserved");
 		assert.ok(replaced.includes("line 102 content"), "line 102 preserved");
 		assert.ok(!replaced.includes("line 50 content"), "line 50 not preserved");
+		assert.ok(!replaced.includes("1\tline"), "N\\t line number prefixes stripped from kept lines");
+	});
+
+	it("strips N\\t prefixes from kept lines when content is numbered", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry() {},
+		};
+		piSift(fakePi as any);
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		const plainLines: string[] = [];
+		for (let i = 1; i <= 50; i++) plainLines.push(`content of line ${i}${"x".repeat(30)}`);
+		const bigContent = plainLines.join("\n");
+		for (const h of handlers.get("tool_result") || []) {
+			h({ type: "tool_result", toolCallId: "tc-numbered", toolName: "read",
+				input: { path: "/src/num.py" }, content: [{ type: "text", text: bigContent }], isError: false }, {});
+		}
+
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-numbered","action":"summarize","summary":"Numbered file.","keepLines":[[2,3]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) h({ message: assistantMsg }, {});
+
+		// Simulate real content: marker + N\t numbered lines
+		const numbered = bigContent.split("\n").map((l, i) => `${i + 1}\t${l}`).join("\n");
+		const markerContent = `[CONTEXT_LENS_SCORE:tc-numbered] This result is ${numbered.length} chars.\n\n${numbered}`;
+		const contextMsgs = [
+			{ role: "toolResult", toolCallId: "tc-numbered", content: [{ type: "text", text: markerContent }] },
+			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
+		];
+		for (const h of handlers.get("context") || []) h({ messages: contextMsgs }, {});
+		const replaced = contextMsgs[0].content[0].text;
+		assert.ok(replaced.includes("content of line 2"), "line 2 content present");
+		assert.ok(replaced.includes("content of line 3"), "line 3 content present");
+		assert.ok(!replaced.includes("2\tcontent"), "N\\t prefix stripped from kept line 2");
+		assert.ok(!replaced.includes("3\tcontent"), "N\\t prefix stripped from kept line 3");
 	});
 
 	it("cachedReplacement is reused on second context pass", async () => {
@@ -723,8 +783,7 @@ describe("Heuristic context pruning", () => {
 		const instruction = buildScoringInstruction([
 			{ toolCallId: "tc-1", toolName: "read", size: 5000, path: "/test.py", assistantMessagesSinceMarked: 0, instructionInjected: false },
 		]);
-		assert.ok(instruction.includes("Prefer summarize or dismiss"), "scoring prompt should contain bias text");
-		assert.ok(instruction.includes("re-reading is cheap"), "scoring prompt should mention re-reading cost");
+		assert.ok(instruction.includes("Prefer summarize over keep"), "scoring prompt should contain bias text");
 	});
 
 	it("heuristic dismiss overrides existing keep decision", async () => {
