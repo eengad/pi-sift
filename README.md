@@ -4,7 +4,7 @@ A [Pi Coding Agent](https://github.com/nicepkg/pi-coding-agent) extension that p
 
 ## How it works
 
-1. When a tool result exceeds a size threshold, pi-sift appends a scoring prompt asking the model to decide: **keep**, **summarize**, or **dismiss**.
+1. When a tool result exceeds a size threshold, pi-sift appends a scoring prompt asking the model to decide: **keep** or **summarize**.
 2. On summarize, the model can specify `keepLines` — line ranges to preserve verbatim while compressing the rest.
 3. Before each API call, the context hook replaces scored content with the summary + kept lines.
 4. Heuristic dismiss auto-removes stale reads when files are re-read or edited, but preserves summarize+keepLines decisions.
@@ -66,6 +66,11 @@ Analyse session logs after a run:
 ```bash
 npm run analyse-session -- /tmp/tmp.XXX/task_0/extension_run1/sessions/*.jsonl
 ```
+
+## Model compatibility
+
+- **Claude Opus 4.6** — works well. The model follows scoring instructions reliably and uses `keepLines` effectively.
+- **OpenAI Codex 5.3 (xhigh thinking)** — does not work. The model sees the scoring instruction (thinking summaries confirm it considers emitting `<context_lens>` blocks) but consistently skips scoring and emits only tool calls. This may improve with future Codex versions.
 
 ## Known issues
 

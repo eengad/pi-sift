@@ -25,6 +25,19 @@ Raised from 2000 to 5000. Small targeted reads (agent already curated the range 
 
 ---
 
+## Force scoring before continuing
+
+When the model ignores the scoring instruction (responds with only tool calls, no `<context_lens>` block), the large tool result sits unscored in context indefinitely. This was observed consistently with Codex 5.3 and occasionally with Opus 4.6.
+
+The current fallback (apply `keep` after 2 text-bearing turns) rarely fires because most intermediate turns are tool-call-only, and `keep` provides no compression anyway.
+
+Possible approaches:
+- **Withhold next tool result**: intercept the next `tool_result` and replace it with a message demanding scoring first. Aggressive — could slow or confuse the model.
+- **Synthetic user turn**: inject a user message before the next API call that only contains the scoring instruction, forcing a text response. Intrusive — adds a visible turn.
+- **Count all turns** (not just text-bearing) toward the fallback threshold. Wouldn't force scoring but would at least resolve pending state sooner.
+
+None of these are great. Opus scores reliably enough that this isn't urgent, but it's the main gap for non-Anthropic models.
+
 ## Fork-based A/B benchmarking
 The current independent-runs A/B approach has high variance (model runs can differ 20-30% in tokens
 with no changes). A fork approach would snapshot the session at the first large tool result, then run

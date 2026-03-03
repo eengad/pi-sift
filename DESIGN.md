@@ -231,6 +231,28 @@ The `<context_lens>` block emitted by the agent in its response must be stripped
 
 **Fork/branch behavior:** Since tool results remain full in JSONL, forks naturally get full content. The extension rebuilds decisions from custom entries along the branch path. Different branches can have different scoring decisions — correct behavior.
 
+## Provider-Specific: Compound Tool Call ID Canonicalization
+
+Some LLM providers use compound tool call IDs — e.g. OpenAI Codex emits IDs like
+`call_HDJ38HwQI28dDcWS8cIZpQzS|fc_00c30bd6ee2b86390169a75577cbc48191b62771fe65365125`.
+Anthropic Claude uses simple IDs like `toolu_018GxcLKGdcansaszXbTdaV8`.
+
+pi-sift stores decisions under a **canonical** (short) form: everything before the first
+`|` pipe character (`call_HDJ38HwQI28dDcWS8cIZpQzS`). The scoring prompt also uses this
+short form to keep token cost down. However, the model sees the **full compound ID** in
+the conversation's `toolCall` and `toolResult` messages.
+
+This mismatch caused a real bug: in Codex 5.3 benchmarks, the model received scoring
+instructions referencing `call_XXX` but saw `call_XXX|fc_YYY` everywhere in context. It
+couldn't match them, silently skipped scoring, and large reads (27k + 57k chars) sat
+unscored for the entire session. The model's thinking even noted "Preparing context lens
+block" but never emitted one — the ID mismatch made the instruction appear invalid.
+
+**Fix:** The `context` hook canonicalizes all tool call IDs before sending messages to the
+API — both `toolCall.id` in assistant messages and `toolResult.toolCallId`. This ensures
+the model sees the same short IDs used in the scoring prompt. For providers with simple IDs
+(no `|`), `canonicalToolCallId` is a no-op.
+
 ## Open Questions
 
 - How well do current models follow the `<context_lens>` structured output instruction in practice? Needs empirical testing.

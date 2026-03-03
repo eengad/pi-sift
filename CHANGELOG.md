@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0
+
+### Features
+
+- **Scoring task block stripping.** Scoring instructions (`[pi-sift scoring task]...[/pi-sift scoring task]`) are injected ephemerally into user messages before each API call. On session reload, stale instructions could persist and accumulate in context, wasting tokens and confusing the model. The context hook now strips these blocks (both the current bounded format and the legacy unbounded format). Also handles `<context_lens>` and scoring-task blocks that span across adjacent text blocks in the message content array.
+- **Source header on summarize replacements.** Summarized tool results now show `[pi-sift summarized: <path> lines <start>-<end>]` with the actual file path and line range from the tool call, so the model knows exactly what was summarized even if its own summary text is inaccurate.
+- **Verbatim hint on kept lines.** Kept line section headers now say `(verbatim, do not re-read)` to discourage redundant re-reads of content already preserved in context.
+- **Invalid toolCallId reminder.** When the model emits a `<context_lens>` decision with an unknown toolCallId, a one-shot reminder is injected into the next context explaining the error.
+- **Unscored result reporting.** `analyse-session.py` now reports large tool results (≥5000 chars) that were never scored by the model, distinguishing model-initiated decisions from heuristic-only ones.
+
+### Bug fixes
+
+- **Compound toolCallId canonicalization.** Some providers (e.g. OpenAI Codex) use compound IDs like `call_XXX|fc_YYY`. The context hook now canonicalizes these to the short prefix form in both `toolCall` and `toolResult` messages, matching the form used in scoring instructions. Previously, the ID mismatch caused models to silently skip scoring.
+
+### Documentation
+
+- Added model compatibility section to README (Opus 4.6 works well, Codex 5.3 does not).
+- Documented compound ID canonicalization rationale in DESIGN.md.
+- Added force-scoring improvement idea to IMPROVEMENTS.md.
+
 ## 0.2.0
 
 ### Breaking changes
