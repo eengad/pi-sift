@@ -27,6 +27,9 @@
   ],
   "author": "Eyal En Gad",
   "license": "MIT",
+  "pi": {
+    "extensions": ["./dist/index.js"]
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "^0.54.0"
   },
