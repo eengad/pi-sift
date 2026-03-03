@@ -19,6 +19,7 @@ interface LensDecision {
 	action: LensAction;
 	summary?: string;
 	keepLines?: [number, number][];
+	lineOffset?: number; // 1-based starting file line number (default 1 for full reads)
 	cachedReplacement?: string;
 	timestamp: number;
 }
@@ -28,6 +29,7 @@ interface PendingDecision {
 	toolName: string;
 	size: number;
 	path?: string;
+	lineOffset?: number; // 1-based starting file line number for offset reads
 	assistantMessagesSinceMarked: number;
 	instructionInjected: boolean;
 }
@@ -50,7 +52,7 @@ const DEFAULT_CONFIG: LensConfig = {
 // files. Do NOT rename them — it would break existing sessions on reload.
 const CUSTOM_ENTRY_TYPE = "context_lens_decision";
 const BLOCK_REGEX = /<context_lens>([\s\S]*?)<\/context_lens>/g;
-const MARKER_PREFIX = "[CONTEXT_LENS_SCORE:";
+
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
@@ -74,13 +76,13 @@ const stripLineNumbers = (text: string): string =>
 		return (tab !== -1 && /^\d+$/.test(line.slice(0, tab))) ? line.slice(tab + 1) : line;
 	}).join("\n");
 
-const extractLineRange = (text: string, ranges: [number, number][]): string => {
+const extractLineRange = (text: string, ranges: [number, number][], firstLine: number = 1): string => {
 	const lines = text.split("\n");
+	const base = firstLine - 1; // offset to convert file line numbers to 0-based array indices
 	const kept: string[] = [];
 	for (const [start, end] of ranges) {
-		// 1-based line numbers → 0-based indices
-		const lo = Math.max(0, start - 1);
-		const hi = Math.min(lines.length, end);
+		const lo = Math.max(0, start - 1 - base);
+		const hi = Math.min(lines.length, end - base);
 		for (let i = lo; i < hi; i++) {
 			kept.push(lines[i]);
 		}
@@ -100,13 +102,14 @@ const isValidKeepLines = (value: unknown): value is [number, number][] => {
 
 const parseDecisionPayload = (payload: unknown): LensDecision | null => {
 	if (!isObject(payload)) return null;
-	const { toolCallId, action, summary, keepLines } = payload;
+	const { toolCallId, action, summary, keepLines, lineOffset } = payload;
 	if (typeof toolCallId !== "string") return null;
 	if (action !== "keep" && action !== "summarize") return null;
 	if (summary !== undefined && typeof summary !== "string") return null;
 	if (keepLines !== undefined && !isValidKeepLines(keepLines)) return null;
 	const decision: LensDecision = { toolCallId, action, summary, timestamp: Date.now() };
 	if (keepLines !== undefined) decision.keepLines = keepLines as [number, number][];
+	if (typeof lineOffset === "number" && lineOffset > 1) decision.lineOffset = lineOffset;
 	return decision;
 };
 
@@ -326,26 +329,28 @@ export default function piSift(pi: ExtensionAPI) {
 			readFileToolCallIds.set(path, { id: canonicalToolCallId(event.toolCallId), isFullRead: !hasOffset });
 		}
 
+		// Determine starting line number for offset reads (pi's read tool uses 1-based offset)
+		const lineOffset = (isObject(event.input) && typeof event.input.offset === "number" && event.input.offset > 0)
+			? event.input.offset : 1;
+
 		const canonicalId = canonicalToolCallId(event.toolCallId);
 		pendingDecisions.set(canonicalId, {
 			toolCallId: canonicalId,
 			toolName: event.toolName,
 			size,
 			path,
+			lineOffset: lineOffset > 1 ? lineOffset : undefined,
 			assistantMessagesSinceMarked: 0,
 			instructionInjected: false,
 		});
-
-		// Prepend lightweight marker inline; scoring instruction is injected via context hook.
-		const marker = `${MARKER_PREFIX}${event.toolCallId}] This result is ${size} chars.\n\n`;
 
 		hasMarkedResults = true;
 		console.error(`[pi-sift] marking tool_result id=${event.toolCallId} size=${size}`);
 
 		const text = extractText(event.content);
-		// Add line numbers so the model can make accurate keepLines selections
-		const numbered = text.split("\n").map((line, i) => `${i + 1}\t${line}`).join("\n");
-		return { content: [{ type: "text" as const, text: marker + numbered }] };
+		// Add line numbers using file line numbers so the model can make accurate keepLines selections
+		const numbered = text.split("\n").map((line, i) => `${lineOffset + i}\t${line}`).join("\n");
+		return { content: [{ type: "text" as const, text: numbered }] };
 	});
 
 	// Parse and strip <context_lens> blocks from assistant messages, persist decisions.
@@ -356,10 +361,13 @@ export default function piSift(pi: ExtensionAPI) {
 
 		const persistDecision = (decision: LensDecision) => {
 			const canonicalId = canonicalToolCallId(decision.toolCallId);
+			// Carry lineOffset from the pending decision (not emitted by the model)
+			const pending = pendingDecisions.get(canonicalId);
 			const normalized: LensDecision = {
 				...decision,
 				toolCallId: canonicalId,
 				timestamp: decision.timestamp || Date.now(),
+				...(pending?.lineOffset ? { lineOffset: pending.lineOffset } : {}),
 			};
 			decisions.set(canonicalId, normalized);
 			pendingDecisions.delete(canonicalId);
@@ -401,30 +409,48 @@ export default function piSift(pi: ExtensionAPI) {
 			if (!config.dryRun) pi.appendEntry(CUSTOM_ENTRY_TYPE, fallbackDecision);
 			console.error(`[pi-sift] fallback decision applied id=${id} action=keep`);
 		}
+
+		// Strip <context_lens> blocks from the message IN-PLACE so they don't
+		// appear in the TUI or get persisted to the session file.
+		// Extensions fire before TUI rendering and session persistence.
+		if (typeof content === "string") {
+			const stripped = stripBlocks(content);
+			if (stripped !== content) {
+				(event.message as any).content = [{ type: "text", text: stripped }];
+			}
+		} else if (Array.isArray(content)) {
+			let blockChanged = false;
+			for (const block of content as MessageTextBlock[]) {
+				if (block?.type !== "text" || typeof block.text !== "string") continue;
+				const stripped = stripBlocks(block.text);
+				if (stripped !== block.text) {
+					block.text = stripped;
+					blockChanged = true;
+				}
+			}
+			if (blockChanged) {
+				(event.message as any).content = (content as unknown as MessageTextBlock[]).filter(
+					(block) => block.type !== "text" || (typeof block.text === "string" && block.text !== ""),
+				);
+			}
+		}
 	});
 
 	// Inject scoring instruction for pending results + apply persisted decisions.
-	// Also strip <context_lens> blocks from older assistant messages to avoid
-	// leaking scoring metadata into the context window. The LAST assistant
-	// message is left untouched because the Anthropic API validates thinking
-	// block integrity for that message.
+	// Strip <context_lens> blocks from all assistant messages (text blocks only,
+	// preserving thinking blocks for Anthropic API validation).
 	pi.on("context", (event) => {
 		if (!config.enabled) return;
 
 		let changed = false;
 		let decisionsAppliedThisPass = false;
 
-		// Strip <context_lens> blocks from all assistant messages except the last one.
-		let lastAssistantIdx = -1;
-		for (let i = event.messages.length - 1; i >= 0; i--) {
-			if (isObject(event.messages[i]) && event.messages[i].role === "assistant") {
-				lastAssistantIdx = i;
-				break;
-			}
-		}
+		// Strip <context_lens> blocks from all assistant messages.
+		// For the last assistant message, only strip from text blocks (not thinking blocks)
+		// to preserve Anthropic API thinking block integrity validation.
 		for (let i = 0; i < event.messages.length; i++) {
 			const msg = event.messages[i];
-			if (!isObject(msg) || msg.role !== "assistant" || i === lastAssistantIdx) continue;
+			if (!isObject(msg) || msg.role !== "assistant") continue;
 			const content = msg.content;
 			if (typeof content === "string") {
 				const stripped = stripBlocks(content);
@@ -454,11 +480,30 @@ export default function piSift(pi: ExtensionAPI) {
 
 		const toPrompt = Array.from(pendingDecisions.values()).filter((pending) => !pending.instructionInjected);
 		if (toPrompt.length > 0) {
-			event.messages.push({
-				role: "user",
-				content: [{ type: "text", text: buildScoringInstruction(toPrompt) }],
-				timestamp: Date.now(),
-			});
+			const instruction = buildScoringInstruction(toPrompt);
+			// Append to the last user message instead of pushing a new one,
+			// so the scoring instruction doesn't leak as a visible message in the TUI.
+			let injected = false;
+			for (let i = event.messages.length - 1; i >= 0; i--) {
+				const msg = event.messages[i];
+				if (!isObject(msg) || msg.role !== "user") continue;
+				const content = msg.content;
+				if (typeof content === "string") {
+					msg.content = [{ type: "text", text: content }, { type: "text", text: instruction }];
+				} else if (Array.isArray(content)) {
+					(content as MessageTextBlock[]).push({ type: "text", text: instruction });
+				}
+				injected = true;
+				break;
+			}
+			if (!injected) {
+				// Fallback: no user message found, push one (shouldn't happen in practice)
+				event.messages.push({
+					role: "user",
+					content: [{ type: "text", text: instruction }],
+					timestamp: Date.now(),
+				});
+			}
 			for (const pending of toPrompt) pending.instructionInjected = true;
 			changed = true;
 		}
@@ -472,13 +517,11 @@ export default function piSift(pi: ExtensionAPI) {
 			if (!decision) continue;
 
 			if (decision.action === "keep") {
-				// Strip scoring marker and N\t line numbers — not needed after scoring
+				// Strip N\t line numbers — not needed after scoring
 				const text = extractText(msg.content);
-				const markerEnd = text.indexOf(MARKER_PREFIX) === 0
-					? text.indexOf("\n\n", MARKER_PREFIX.length)
-					: -1;
-				if (markerEnd !== -1) {
-					msg.content = [{ type: "text", text: stripLineNumbers(text.slice(markerEnd + 2)) }];
+				const stripped = stripLineNumbers(text);
+				if (stripped !== text) {
+					msg.content = [{ type: "text", text: stripped }];
 					changed = true;
 				}
 				continue;
@@ -492,15 +535,11 @@ export default function piSift(pi: ExtensionAPI) {
 			} else {
 				const baseSummary = decision.summary || "[pi-sift: summarized]";
 				if (decision.keepLines && decision.keepLines.length > 0) {
-					let originalText = extractText(msg.content);
-					// Strip the CONTEXT_LENS_SCORE marker so line numbers match the original file
-					const markerEnd = originalText.indexOf(MARKER_PREFIX) === 0
-						? originalText.indexOf("\n\n", MARKER_PREFIX.length)
-						: -1;
-					if (markerEnd !== -1) originalText = originalText.slice(markerEnd + 2);
+					const originalText = extractText(msg.content);
+					const firstLine = decision.lineOffset || 1;
 					const sections: string[] = [];
 					for (const [start, end] of decision.keepLines) {
-						const raw = extractLineRange(originalText, [[start, end]]);
+						const raw = extractLineRange(originalText, [[start, end]], firstLine);
 						if (raw) sections.push(`--- kept lines ${start}-${end} ---\n${stripLineNumbers(raw)}`);
 					}
 					replacement = sections.length > 0

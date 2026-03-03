@@ -1,5 +1,13 @@
 # Potential Improvements
 
+## Make kept-lines headers clearer to reduce redundant re-reads
+The model sometimes re-reads line ranges that are already preserved verbatim via keepLines. For example, in haystack the model kept lines 363-467 but later re-read 363-413 (fully within the kept range). The current header `--- kept lines 363-467 ---` doesn't make it obvious that these lines are still available in context. Consider a more explicit header like `--- file lines 363-467 (verbatim, still in context — no need to re-read) ---`.
+
+## ~~Kept-lines headers should show file line numbers, not tool-result-relative numbers~~ ✅ Done
+Tool results from offset reads are now numbered starting from the file offset (e.g., `200\tline content`), and `lineOffset` is persisted in decisions. `extractLineRange` adjusts indexing so keepLines values and `--- kept lines X-Y ---` headers always reflect real file line numbers. Unit-tested; manually verified in live pi session (offset read from line 400 produced correct file-relative headers).
+
+---
+
 ## ~~Rename to pi-sift~~ ✅ Done
 Renamed from `pi-context-lens`. Internal protocol strings (`<context_lens>`, `context_lens_decision`) kept as-is for session compatibility.
 
@@ -24,8 +32,8 @@ one branch with compression and one without. This isolates the decision's actual
 conflating it with run-to-run variance. Non-trivial to implement: requires injecting the full
 uncompressed tool result back into the baseline branch at the fork point.
 
-## Remove inline marker from tool_result hook
-The `[CONTEXT_LENS_SCORE:id]` marker prepended in the `tool_result` hook may be redundant. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them. Removing the marker would reduce context size. Blocked on having a reliable way to verify it doesn't degrade scoring accuracy.
+## ~~Remove inline marker from tool_result hook~~ ✅ Done
+The `[CONTEXT_LENS_SCORE:id]` marker has been removed. The scoring instruction injected via the `context` hook already lists each pending result with tool name, path, and size — enough for the model to identify them.
 
 ## Consider scoring error results
 Currently errors are unconditionally skipped. But long stack traces / compilation errors could benefit from summarization — the model doesn't always need the full output to debug. Also, after debugging, the error stays in context until compaction. Different behavior to design than normal results — needs its own approach.

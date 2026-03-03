@@ -32,17 +32,17 @@ Scoring runs in `mode: "piggyback"`, where the primary agent does scoring as par
 A separate model call is optional and only used in `mode: "external-model"`.
 
 **Mode A — Piggyback (zero-cost, recommended default)**
-- Scoring instructions are injected **conditionally, not permanently**. The `tool_result` hook sets a flag when a read/grep/bash result arrives **and the result exceeds a character threshold** (default: 2000 chars, configurable via `minCharsToScore`). Small files aren't worth the scoring overhead — a 50-line config file costs negligible context. The `before_agent_start` hook checks the flag and only appends scoring instructions to the system prompt for **the next agent loop iteration**. Flag is cleared after. This keeps the system prompt clean during turns with no tool results or only small reads.
-- Note on timing: the flag is set during `tool_result` in iteration N, and picked up by `before_agent_start` in iteration N+1. This is the earliest the LLM can evaluate the content — it needs to see the result before it can score it.
-- The injected instruction tells the agent to emit a structured `<context_lens>` block: `{action: "keep" | "summarize" | "dismiss", summary?: string, toolCallId: string}`
+- Scoring instructions are injected **conditionally, not permanently**. The `tool_result` hook marks results that exceed a character threshold (default: 5000 chars, configurable via `minCharsToScore`). Small files aren't worth the scoring overhead — a 50-line config file costs negligible context. The `context` hook checks for pending (unscored) results and appends a scoring instruction to the **last user message** (not as a separate message, to avoid TUI artifacts). This keeps the prompt clean during turns with no large tool results.
+- Marked tool results are line-numbered (e.g., `1\tfunction hello() {`) so the model can specify precise `keepLines` ranges. For offset reads (e.g., `read foo.py` starting at line 200), line numbers start from the file offset, not 1.
+- The injected instruction tells the agent to emit a structured `<context_lens>` block: `{action: "keep" | "summarize" | "dismiss", summary?: string, toolCallId: string, keepLines?: [[start, end], ...]}`
 - At `message_end` (for the assistant message), the extension:
   1. Parses the `<context_lens>` block from the assistant response
-  2. Strips the block from `event.message.content` (same object reference as in `state.messages`, so the mutation persists)
-  3. Records the decision in an in-memory Map keyed by `toolCallId`
-  4. Persists the decision via `pi.appendEntry("context_lens_decision", { toolCallId, action, summary })` for session reload survival
-- On subsequent turns, the `context` event handler applies decisions: iterates through the cloned message array, replaces tool result content for any `toolCallId` found in the decision Map.
+  2. **Strips the block in-place** from `event.message.content` — this runs before TUI rendering and session persistence, so `<context_lens>` blocks never appear in the saved session or the user-visible display
+  3. Records the decision in an in-memory Map keyed by `toolCallId`, including `lineOffset` for offset reads
+  4. Persists the decision via `pi.appendEntry("context_lens_decision", { toolCallId, action, summary, keepLines, lineOffset })` for session reload survival
+- On subsequent turns, the `context` event handler applies decisions: iterates through the cloned message array, replaces tool result content for any `toolCallId` found in the decision Map. For `summarize` with `keepLines`, the replacement includes a summary header plus `--- kept lines X-Y ---` sections with verbatim file content (line numbers stripped). The `lineOffset` ensures correct extraction when the original was an offset read.
 - On `session_start` (reload), the extension scans `ctx.sessionManager.getEntries()` for entries with `customType === "context_lens_decision"` and rebuilds the decision Map.
-- **Why `context` event, not in-place mutation:** The extension API does not expose `agent.state.messages` to handlers. `ExtensionContext` provides only `ReadonlySessionManager`. The `context` event is Pi's designed mechanism for modifying the LLM's view — it receives a `structuredClone` of messages and returns modified ones. State is not affected.
+- **Why `context` event, not in-place mutation:** The extension API does not expose `agent.state.messages` to handlers. `ExtensionContext` provides only `ReadonlySessionManager`. The `context` event is Pi's designed mechanism for modifying the LLM's view — it receives a `structuredClone` of messages and returns modified ones. State is not affected. (Exception: `message_end` does mutate `event.message.content` in-place for block stripping — this works because the message object reference is shared with state, and `appendMessage` runs after extension handlers.)
 - **Overhead:** The `structuredClone` is already done by Pi on every turn regardless. The extension adds only a Map lookup per tool result message in the clone — negligible. If no decisions exist yet, the handler returns immediately (fast path).
 - Tradeoff: the full tool result is seen by the LLM for exactly one iteration (the scoring iteration) before being replaced in subsequent views. This is the minimum possible — you need at least one pass to score it.
 - Cost: zero additional LLM calls — the agent is already reasoning about the content
@@ -59,14 +59,13 @@ Start with Mode A (piggyback) — no extra API key, no extra latency, works with
 
 ```
 pi-sift/
-├── index.ts          # Main extension factory: registers all hooks
-├── prompt.ts         # System prompt injection for context scoring
-├── decisions.ts      # Decision Map: in-memory store + rebuild from session entries
-├── context.ts        # context event handler: applies decisions to cloned messages
-├── parser.ts         # Parses <context_lens> blocks from assistant messages
-├── scorer.ts         # External model scorer (Mode B)
-├── config.ts         # User configuration
-├── DESIGN.md         # Human-facing docs: philosophy, usage, how scoring works
+├── src/
+│   ├── index.ts          # Single-file extension: all hooks, scoring, decisions, context handling
+│   ├── index.test.ts     # Unit and integration tests (64 tests)
+│   └── validation.test.ts # Input validation tests
+├── DESIGN.md
+├── IMPROVEMENTS.md
+├── README.md
 └── package.json
 ```
 
@@ -89,7 +88,7 @@ pi-sift/
   "reevalMaxCharsPerTurn": 6000,
   "keepThreshold": 0.7,
   "tools": ["read", "grep", "bash"],
-  "minCharsToScore": 2000,
+  "minCharsToScore": 5000,
   "preReadGateChars": 12000,
   "preReadPreviewLines": 120,
   "editedFileProtectionTurns": 4,
@@ -125,16 +124,17 @@ Instructs the agent to:
 
 ## Implementation Phases
 
-### Phase 1 — Piggyback mode (V1)
-- `tool_result` → set scoring flag when result exceeds `minCharsToScore`
-- `before_agent_start` → conditionally append scoring instructions to system prompt
-- `message_end` → parse `<context_lens>` block, strip from assistant message, record decision in Map, persist via `pi.appendEntry()`
-- `context` → apply decisions to cloned messages (fast path: skip if Map empty)
+### Phase 1 — Piggyback mode (V1) ✅ Done
+- `tool_result` → mark results exceeding `minCharsToScore`, add line numbers (offset-aware), track for heuristic dismiss
+- `context` → inject scoring instruction (appended to last user message) for pending results; apply decisions to cloned messages; strip `<context_lens>` blocks from all assistant messages
+- `message_end` → parse `<context_lens>` block, **strip blocks in-place** (before TUI rendering and session persistence), record decision in Map (with `keepLines` and `lineOffset`), persist via `pi.appendEntry()`
 - `session_start` → rebuild decision Map from custom entries
 - Protect recently edited files (skip scoring for files written/edited within last N turns)
-- Fail-safe: on parse failure or malformed block, default to `keep`
+- Fail-safe: on parse failure or malformed block, default to `keep`; deterministic fallback after 2 assistant turns without a decision
 - `dryRun` mode: log decisions without applying them
 - Basic stats tracking (`/sift-stats` command)
+- `keepLines` support: model can specify line ranges to preserve verbatim within a summarize decision
+- Offset-aware line numbering: `lineOffset` persisted in decisions, `extractLineRange` uses it for correct file-relative indexing
 
 ### Phase 2 — External model mode (optional)
 - `tool_result` hook with external scorer call (e.g., gpt-4o-mini)
@@ -142,9 +142,10 @@ Instructs the agent to:
 - Simpler architecture (one hook, no `context` event)
 - A/B comparison mode to measure quality difference vs piggyback
 
-### Phase 2.5 — Zero-cost heuristic strategies
+### Phase 2.5 — Zero-cost heuristic strategies (partially done)
 Deterministic strategies that require no LLM calls, inspired by [opencode-dynamic-context-pruning](https://github.com/Opencode-DCP/opencode-dynamic-context-pruning). These complement the model-driven scoring by handling cases where the right action is obvious from structure alone:
-- Auto-dismiss older read when the same file is re-read
+- ✅ Auto-dismiss older full read when the same file is re-read (offset reads are not dismissed — they may be complementary sections)
+- ✅ Auto-dismiss reads after the file is edited (overrides existing model decisions since staleness is deterministic)
 - Supersede-writes: dismiss write/edit inputs when the file is later read
 - General dedup: same tool + same args → keep only the most recent result
 - Purge error inputs after N turns (keep the error message, strip the input)
@@ -189,7 +190,7 @@ See [`IMPROVEMENTS.md`](./IMPROVEMENTS.md) for detailed descriptions and impleme
 | **Timing** | Retroactive — model reviews accumulated context and decides what to prune | Proactive — each result scored before it accumulates across turns |
 | **Trigger** | Agent-driven: model must recognize it should manage context, nudged periodically | Extension-driven: automatic on every large tool result |
 | **Granularity** | Model picks from a `<prunable-tools>` list of past tool outputs | Per-result: each tool result scored as it arrives |
-| **Rule-based strategies** | Dedup, supersede-writes, purge-errors (zero LLM cost) | Not in scope (complementary with pi-rtk) |
+| **Rule-based strategies** | Dedup, supersede-writes, purge-errors (zero LLM cost) | Partial: auto-dismiss on re-read and edit (Phase 2.5); remaining strategies planned |
 | **Conversation compression** | `compress` tool can collapse entire conversation ranges | Not in scope — focused on tool results only |
 
 DCP validated the problem space but took a fundamentally different approach: it gives the model a context management toolkit and relies on the model to use it. Pi-sift forces automatic evaluation on every large result without requiring model initiative or extra tool calls.
@@ -204,11 +205,11 @@ DCP validated the problem space but took a fundamentally different approach: it 
 The `<context_lens>` block emitted by the agent in its response must be stripped from the assistant message after parsing. Otherwise the scoring metadata itself accumulates in context, partially defeating the purpose.
 
 **Flow (piggyback mode):**
-1. `message_end` handler parses the `<context_lens>` block from `event.message.content`
-2. Strips the block by mutating `event.message.content` (same JS object reference as in `state.messages` — this mutation affects both the in-memory state and what gets persisted by `appendMessage` immediately after)
-3. Records `{ toolCallId, action, summary }` in an in-memory decision Map
-4. Persists the decision via `pi.appendEntry("context_lens_decision", { toolCallId, action, summary })` — this is a separate JSONL entry that survives session reload
-5. On future turns, `context` event handler replaces matching tool results in the cloned message array
+1. `tool_result` handler marks large results, adds offset-aware line numbers, tracks file paths for heuristic dismiss
+2. `context` handler appends scoring instruction to the last user message for any pending (unscored) results; also strips `<context_lens>` blocks from all assistant messages and applies decisions to tool results
+3. `message_end` handler parses the `<context_lens>` block from `event.message.content`, strips blocks **in-place** (before TUI rendering and session persistence), records `{ toolCallId, action, summary, keepLines, lineOffset }` in an in-memory decision Map
+4. Persists the decision via `pi.appendEntry("context_lens_decision", { toolCallId, action, summary, keepLines, lineOffset })` — this is a separate JSONL entry that survives session reload
+5. On future turns, `context` event handler replaces matching tool results in the cloned message array (with cached replacements for efficiency)
 
 **Flow (external model mode):**
 1. `tool_result` handler calls external scorer with task description + tool result content
@@ -216,10 +217,9 @@ The `<context_lens>` block emitted by the agent in its response must be stripped
 3. Clean and simple — no `context` event needed, no per-turn overhead
 
 **Key APIs (verified against Pi v0.54.2 source):**
-- `tool_result` handler → returns `ToolResultEventResult { content?, details?, isError? }` — modifies result before it enters state (Mode B)
-- `before_agent_start` handler → returns `{ systemPrompt? }` — replaces system prompt for the turn, chained across extensions
-- `message_end` handler → void return, but `event.message` is same object reference as in state, so mutations to it persist
-- `context` event → receives `structuredClone(messages)`, returns `{ messages }` — modifies LLM's view without affecting state (Mode A)
+- `tool_result` handler → returns `ToolResultEventResult { content?, details?, isError? }` — modifies result before it enters state (used in Mode A for line numbering, Mode B for full replacement)
+- `message_end` handler → void return, but `event.message` is same object reference as in state, so mutations to it persist (used for in-place `<context_lens>` block stripping)
+- `context` event → receives `structuredClone(messages)`, returns `{ messages }` — modifies LLM's view without affecting state (used for scoring instruction injection, decision application, and block stripping)
 - `pi.appendEntry(customType, data)` → persists custom entries in JSONL session file
 - `ctx.sessionManager.getEntries()` → read all entries including custom ones (for rebuild on reload)
 

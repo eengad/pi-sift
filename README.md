@@ -67,6 +67,11 @@ Analyse session logs after a run:
 npm run analyse-session -- /tmp/tmp.XXX/task_0/extension_run1/sessions/*.jsonl
 ```
 
+## Known issues
+
+### Streaming flash of `<context_lens>` blocks
+During streaming, `<context_lens>` blocks are briefly visible in the TUI before `message_end` strips them. Fixing in `message_update` is unsafe — the pi agent may rebuild message content from the stream buffer on each update (undoing mutations), and stripping before `message_end` would remove blocks before decision parsing runs. Cosmetic only; disappears when streaming completes.
+
 ## Links
 
 - Design: [`DESIGN.md`](./DESIGN.md)

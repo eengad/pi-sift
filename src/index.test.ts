@@ -53,7 +53,7 @@ describe("stripBlocks", () => {
 	it("trims", () => { assert.equal(stripBlocks("  text  "), "text"); });
 });
 
-describe("Mode A inline marker flow", () => {
+describe("Mode A inline scoring flow", () => {
 	it("marks large tool results and strips decisions from responses", async () => {
 		const { default: piSift } = await import("./index.js");
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
@@ -73,7 +73,7 @@ describe("Mode A inline marker flow", () => {
 
 		// No before_agent_start — scoring instructions are inline with markers now
 
-		// tool_result with large content — should prepend marker
+		// tool_result with large content — should add line numbers
 		let trResult: any;
 		for (const h of handlers.get("tool_result") || []) {
 			trResult = h({
@@ -83,8 +83,8 @@ describe("Mode A inline marker flow", () => {
 		}
 		assert.ok(trResult);
 		const markedText = trResult.content[0].text;
-		assert.ok(markedText.startsWith("[CONTEXT_LENS_SCORE:tc-1]"));
-		assert.ok(markedText.includes("This result is 5000 chars."));
+		// No marker prefix — just line-numbered content
+		assert.ok(markedText.startsWith("1\t"));
 		assert.ok(markedText.includes("x".repeat(100))); // original content preserved
 
 		// context hook should inject scoring instruction in control message lane
@@ -108,8 +108,8 @@ describe("Mode A inline marker flow", () => {
 		for (const h of handlers.get("message_end") || []) {
 			h({ message: assistantMsg }, {});
 		}
-		// Content must remain unmodified (no stripping) to preserve thinking block integrity
-		assert.ok(assistantMsg.content[0].text.includes("context_lens"), "message_end must NOT strip context_lens blocks");
+		// message_end strips <context_lens> blocks in-place (before TUI rendering and session persistence)
+		assert.ok(!assistantMsg.content[0].text.includes("context_lens"), "message_end must strip context_lens blocks");
 		assert.ok(assistantMsg.content[0].text.includes("analysis"));
 		assert.equal(appended.length, 1);
 		assert.equal((appended[0].data as any).action, "summarize");
@@ -133,8 +133,9 @@ describe("Mode A inline marker flow", () => {
 		// older assistant message stripped
 		assert.ok(!ctxResult.messages[1].content[0].text.includes("context_lens"), "older assistant msg should be stripped");
 		assert.ok(ctxResult.messages[1].content[0].text.includes("Analysis"), "non-block text preserved");
-		// latest assistant message left intact
-		assert.ok(ctxResult.messages[3].content[0].text.includes("context_lens"), "latest assistant msg must NOT be stripped");
+		// latest assistant message also stripped now
+		assert.ok(!ctxResult.messages[3].content[0].text.includes("context_lens"), "latest assistant msg should also be stripped");
+		assert.ok(ctxResult.messages[3].content[0].text.includes("Latest reply"), "non-block text preserved in latest msg");
 	});
 
 	it("preserves thinking blocks in latest assistant message", async () => {
@@ -164,18 +165,17 @@ describe("Mode A inline marker flow", () => {
 			],
 		};
 
-		// message_end should parse the decision but leave ALL content intact
+		// message_end should parse the decision and strip <context_lens> blocks in-place
 		for (const h of handlers.get("message_end") || []) {
 			h({ message: thinkingMsg }, {});
 		}
 		assert.equal(appended.length, 1, "decision parsed and persisted");
 		assert.equal((appended[0].data as any).action, "summarize");
-		// Content must be completely unmodified
-		assert.equal(thinkingMsg.content.length, 4, "all 4 blocks preserved");
+		// Thinking blocks preserved, empty text block removed, non-empty text block kept
+		assert.equal(thinkingMsg.content.length, 3, "empty text block removed after stripping");
 		assert.equal(thinkingMsg.content[0].type, "thinking");
-		assert.ok(thinkingMsg.content[1].text!.includes("context_lens"), "text block not stripped by message_end");
-		assert.equal(thinkingMsg.content[2].type, "thinking");
-		assert.equal(thinkingMsg.content[3].text, "Final answer here.");
+		assert.equal(thinkingMsg.content[1].type, "thinking");
+		assert.equal(thinkingMsg.content[2].text, "Final answer here.");
 
 		// context handler: older assistant with thinking blocks gets stripped; latest does not
 		const olderThinkingMsg = {
@@ -218,11 +218,16 @@ describe("Mode A inline marker flow", () => {
 		assert.equal(olderTextBlocks.length, 1, "empty text block removed after stripping");
 		assert.equal(olderTextBlocks[0].text, "old answer");
 
-		// Latest assistant: completely untouched
+		// Latest assistant: thinking blocks untouched, text blocks stripped
 		const latestContent = ctxResult.messages[3].content;
-		assert.equal(latestContent.length, 2, "latest msg blocks untouched");
 		assert.equal(latestContent[0].type, "thinking");
-		assert.ok(latestContent[1].text.includes("context_lens"), "latest msg text not stripped");
+		const latestTextBlocks = latestContent.filter((b: any) => b.type === "text");
+		for (const block of latestTextBlocks) {
+			assert.ok(!block.text.includes("context_lens"), "context_lens stripped from latest msg text blocks");
+		}
+		// The text block was "<context_lens>...</context_lens> result" → stripped to "result"
+		assert.equal(latestTextBlocks.length, 1, "text block with remaining content preserved");
+		assert.ok(latestTextBlocks[0].text.includes("result"), "non-block text preserved in latest msg");
 	});
 
 	it("falls back to deterministic keep when assistant does tool-call-only turns", async () => {
@@ -344,6 +349,28 @@ describe("extractLineRange", () => {
 		assert.ok(result.includes("}"));
 		assert.equal(result.split("\n").length, 2);
 	});
+
+	it("handles offset reads with firstLine parameter", () => {
+		// Simulate an offset read starting at file line 200
+		// The text has 7 lines, representing file lines 200-206
+		const result = extractLineRange(plainText, [[200, 202]], 200);
+		assert.ok(result.includes("function hello()"));
+		assert.ok(result.includes("console.log"));
+		assert.ok(result.includes("}"));
+		assert.ok(!result.includes("function world()"));
+	});
+
+	it("handles multiple ranges with firstLine parameter", () => {
+		const result = extractLineRange(plainText, [[200, 200], [204, 206]], 200);
+		assert.ok(result.includes("function hello()"));
+		assert.ok(!result.includes("console.log"));
+		assert.ok(result.includes("function world()"));
+		assert.ok(result.includes("return 42"));
+	});
+
+	it("returns empty for out-of-range with firstLine", () => {
+		assert.equal(extractLineRange(plainText, [[1, 3]], 200), "");
+	});
 });
 
 describe("parseDecisionPayload keepLines validation", () => {
@@ -426,10 +453,9 @@ describe("keepLines in summarize flow", () => {
 		assert.deepEqual(persisted.keepLines, [[1, 3], [100, 102]]);
 		assert.equal(persisted.cachedReplacement, undefined, "cachedReplacement must not be persisted");
 
-		// Apply via context hook — content has marker prefix like real tool results
-		const markerContent = `[CONTEXT_LENS_SCORE:tc-kl1] This result is ${bigContent.length} chars.\n\n${bigContent}`;
+		// Apply via context hook — content has line numbers like real tool results
 		const contextMsgs = [
-			{ role: "toolResult", toolCallId: "tc-kl1", content: [{ type: "text", text: markerContent }] },
+			{ role: "toolResult", toolCallId: "tc-kl1", content: [{ type: "text", text: bigContent }] },
 			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
 		];
 		let ctxResult: any;
@@ -477,11 +503,10 @@ describe("keepLines in summarize flow", () => {
 		};
 		for (const h of handlers.get("message_end") || []) h({ message: assistantMsg }, {});
 
-		// Simulate real content: marker + N\t numbered lines
+		// Simulate real content: N\t numbered lines (no marker prefix)
 		const numbered = bigContent.split("\n").map((l, i) => `${i + 1}\t${l}`).join("\n");
-		const markerContent = `[CONTEXT_LENS_SCORE:tc-numbered] This result is ${numbered.length} chars.\n\n${numbered}`;
 		const contextMsgs = [
-			{ role: "toolResult", toolCallId: "tc-numbered", content: [{ type: "text", text: markerContent }] },
+			{ role: "toolResult", toolCallId: "tc-numbered", content: [{ type: "text", text: numbered }] },
 			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
 		];
 		for (const h of handlers.get("context") || []) h({ messages: contextMsgs }, {});
@@ -490,6 +515,65 @@ describe("keepLines in summarize flow", () => {
 		assert.ok(replaced.includes("content of line 3"), "line 3 content present");
 		assert.ok(!replaced.includes("2\tcontent"), "N\\t prefix stripped from kept line 2");
 		assert.ok(!replaced.includes("3\tcontent"), "N\\t prefix stripped from kept line 3");
+	});
+
+	it("offset read numbers lines from file offset and keepLines uses file line numbers", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry() {},
+		};
+		piSift(fakePi as any);
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		// Simulate a file with 50 lines, read starting at offset 200 (must exceed minCharsToScore=5000)
+		const plainLines: string[] = [];
+		for (let i = 0; i < 50; i++) plainLines.push(`file line ${200 + i} content${"x".repeat(100)}`);
+		const bigContent = plainLines.join("\n");
+
+		// tool_result with offset=200
+		let numberedResult: string | undefined;
+		for (const h of handlers.get("tool_result") || []) {
+			const result = h({ type: "tool_result", toolCallId: "tc-offset", toolName: "read",
+				input: { path: "/src/big.py", offset: 200 },
+				content: [{ type: "text", text: bigContent }], isError: false }, {}) as any;
+			if (result?.content?.[0]?.text) numberedResult = result.content[0].text;
+		}
+
+		// Verify lines are numbered starting from 200
+		assert.ok(numberedResult, "tool_result returned numbered content");
+		assert.ok(numberedResult!.startsWith("200\t"), "first line numbered from offset");
+		assert.ok(numberedResult!.includes("249\t"), "last line uses file line number");
+
+		// Model scores with file line numbers: keep lines 202-204
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-offset","action":"summarize","summary":"Offset read summary.","keepLines":[[202,204]]}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) h({ message: assistantMsg }, {});
+
+		// Context pass — provide the numbered content as stored
+		const contextMsgs = [
+			{ role: "toolResult", toolCallId: "tc-offset", content: [{ type: "text", text: numberedResult }] },
+			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
+		];
+		for (const h of handlers.get("context") || []) h({ messages: contextMsgs }, {});
+		const replaced = contextMsgs[0].content[0].text;
+
+		// Header should show file line numbers
+		assert.ok(replaced.includes("--- kept lines 202-204 ---"), "header shows file line numbers");
+		// Content should be file lines 202, 203, 204 (0-indexed: lines at index 2, 3, 4 of the result)
+		assert.ok(replaced.includes("file line 202 content"), "kept line 202 present");
+		assert.ok(replaced.includes("file line 203 content"), "kept line 203 present");
+		assert.ok(replaced.includes("file line 204 content"), "kept line 204 present");
+		// Should NOT contain adjacent lines
+		assert.ok(!replaced.includes("file line 201 content"), "line 201 not present");
+		assert.ok(!replaced.includes("file line 205 content"), "line 205 not present");
 	});
 
 	it("cachedReplacement is reused on second context pass", async () => {
@@ -529,10 +613,9 @@ describe("keepLines in summarize flow", () => {
 			h({ message: assistantMsg }, {});
 		}
 
-		// First context pass - builds cachedReplacement (with marker prefix like real tool results)
-		const markerContent = `[CONTEXT_LENS_SCORE:tc-cache1] This result is ${bigContent.length} chars.\n\n${bigContent}`;
+		// First context pass - builds cachedReplacement (no marker, just content)
 		const msgs1 = [
-			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: markerContent }] },
+			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: bigContent }] },
 			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
 		];
 		for (const h of handlers.get("context") || []) {
@@ -540,9 +623,9 @@ describe("keepLines in summarize flow", () => {
 		}
 		const firstResult = msgs1[0].content[0].text;
 
-		// Second context pass - should use cachedReplacement. Use fresh big content with marker.
+		// Second context pass - should use cachedReplacement
 		const msgs2 = [
-			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: markerContent }] },
+			{ role: "toolResult", toolCallId: "tc-cache1", content: [{ type: "text", text: bigContent }] },
 			{ role: "assistant", content: [{ type: "text", text: "latest" }] },
 		];
 		for (const h of handlers.get("context") || []) {
@@ -637,9 +720,9 @@ describe("Heuristic context pruning", () => {
 		assert.equal(decision.action, "dismiss");
 		assert.ok(decision.summary.includes("superseded by re-read"));
 
-		// New read should still be marked for scoring (returns content with marker)
+		// New read should still be marked for scoring (returns line-numbered content)
 		assert.ok(result, "new read should be marked for scoring");
-		assert.ok(result.content[0].text.includes("[CONTEXT_LENS_SCORE:tc-read2]"));
+		assert.ok(result.content[0].text.startsWith("1\t"));
 	});
 
 	it("targeted re-read dismisses full read", async () => {
@@ -771,10 +854,10 @@ describe("Heuristic context pruning", () => {
 		// Advance past the edited-file protection window (default 4 turns)
 		for (const h of handlers.get("turn_start") || []) h({ turnIndex: 10 });
 
-		// Fresh read after edit should be scored (returns marker)
+		// Fresh read after edit should be scored (returns line-numbered content)
 		const result = fireToolResult(handlers, { toolCallId: "tc-r2", toolName: "read", path: "/src/file.py", size: 5000 });
 		assert.ok(result, "fresh read should be marked for scoring");
-		assert.ok(result.content[0].text.includes("[CONTEXT_LENS_SCORE:tc-r2]"));
+		assert.ok(result.content[0].text.startsWith("1\t"));
 		// No additional heuristic dismiss (only the one from the edit)
 		assert.equal(appended.length, 1, "no extra heuristic dismiss for fresh read");
 	});
