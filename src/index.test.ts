@@ -49,6 +49,31 @@ describe("parseDecisionsFromText", () => {
 describe("stripBlocks", () => {
 	it("removes single block", () => { assert.equal(stripBlocks("before <context_lens>{}</context_lens> after"), "before  after"); });
 	it("removes multiple", () => { assert.ok(!stripBlocks("<context_lens>a</context_lens><context_lens>b</context_lens>").includes("context_lens")); });
+	it("removes bounded scoring task block", () => {
+		const text = "before\n[pi-sift scoring task]\nline\n[/pi-sift scoring task]\nafter";
+		assert.equal(stripBlocks(text), "before\n\nafter");
+	});
+	it("removes legacy scoring task block without explicit end marker", () => {
+		const text = [
+			"before",
+			"[pi-sift scoring task]",
+			"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
+			"",
+			"Actions:",
+			"- keep: full content stays in context.",
+			"- summarize: replace with a summary. Use keepLines:[[start,end],...] to preserve specific line ranges verbatim — include any lines you may need later.",
+			"",
+			"Prefer summarize over keep — keeping costs tokens every turn.",
+			"Tool results are line-numbered (N<tab>content). Use line numbers for keepLines ranges.",
+			"",
+			"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize\",\"summary\":\"...\",\"keepLines\":[[start,end],...]}</context_lens>",
+			"",
+			"toolCallIds to score: tc-1",
+			"- tc-1: read /src/a.ts (5000 chars)",
+			"after",
+		].join("\n");
+		assert.equal(stripBlocks(text), "before\nafter");
+	});
 	it("collapses newlines", () => { assert.ok(!stripBlocks("a\n\n\n\n\nb").includes("\n\n\n")); });
 	it("trims", () => { assert.equal(stripBlocks("  text  "), "text"); });
 });
@@ -128,8 +153,13 @@ describe("Mode A inline scoring flow", () => {
 			ctxResult = h({ messages: contextMsgs }, {});
 		}
 		assert.ok(ctxResult);
-		// tool result replaced with summary
-		assert.equal(ctxResult.messages[2].content[0].text, "Big file with 5 classes.");
+		// tool result replaced with source header + model summary
+		assert.ok(ctxResult.messages[2].content[0].text.includes("[pi-sift summarized: /big/file.py lines 1-1]"), "should have source header with path and line range");
+		assert.ok(ctxResult.messages[2].content[0].text.includes("Big file with 5 classes."), "should have model summary");
+		// path and lineCount should be persisted on the decision
+		const persistedDecision = appended[0].data as any;
+		assert.equal(persistedDecision.path, "/big/file.py", "path persisted");
+		assert.equal(persistedDecision.lineCount, 1, "lineCount persisted");
 		// older assistant message stripped
 		assert.ok(!ctxResult.messages[1].content[0].text.includes("context_lens"), "older assistant msg should be stripped");
 		assert.ok(ctxResult.messages[1].content[0].text.includes("Analysis"), "non-block text preserved");
@@ -153,6 +183,17 @@ describe("Mode A inline scoring flow", () => {
 		piSift(fakePi as any);
 
 		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				type: "tool_result",
+				toolCallId: "tc-5",
+				toolName: "read",
+				input: { path: "/tmp/tc-5.py" },
+				content: [{ type: "text", text: "x".repeat(6000) }],
+				isError: false,
+			}, {});
+		}
 
 		// Simulate extended-thinking assistant message: [thinking, text_with_block, thinking, text]
 		const thinkingMsg = {
@@ -230,7 +271,93 @@ describe("Mode A inline scoring flow", () => {
 		assert.ok(latestTextBlocks[0].text.includes("result"), "non-block text preserved in latest msg");
 	});
 
-	it("falls back to deterministic keep when assistant does tool-call-only turns", async () => {
+	it("parses and strips split <context_lens> blocks across adjacent text blocks", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const appended: Array<{ type: string; data: unknown }> = [];
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
+		};
+		piSift(fakePi as any);
+
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				type: "tool_result",
+				toolCallId: "tc-split",
+				toolName: "read",
+				input: { path: "/tmp/split.py" },
+				content: [{ type: "text", text: "x".repeat(6000) }],
+				isError: false,
+			}, {});
+		}
+
+		const assistantMsg = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: 'prefix <context_lens>{"toolCallId":"tc-split","action":"summarize",' },
+				{ type: "text", text: '"summary":"split decision"}</context_lens> suffix' },
+			],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+
+		assert.equal(appended.length, 1, "split decision should be parsed once");
+		assert.equal((appended[0].data as any).toolCallId, "tc-split");
+		const mergedText = assistantMsg.content
+			.filter((b: any) => typeof b.text === "string")
+			.map((b: any) => b.text)
+			.join("\n");
+		assert.ok(!mergedText.includes("context_lens"), "split block should be stripped");
+		assert.ok(mergedText.includes("prefix"), "prefix text preserved");
+		assert.ok(mergedText.includes("suffix"), "suffix text preserved");
+	});
+
+	it("strips split scoring-task blocks across adjacent text blocks in context", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry() {},
+		};
+		piSift(fakePi as any);
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		const contextMsgs = [{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "before\n[pi-sift scoring task]\nEmit one <context_lens> JSON block for each listed toolCallId, then continue working on the task." },
+				{ type: "text", text: "\n\ntoolCallIds to score: tc-1\n- tc-1: read /tmp/a.ts (5000 chars)\n[/pi-sift scoring task]\nafter" },
+			],
+		}];
+		let ctxResult: any;
+		for (const h of handlers.get("context") || []) {
+			ctxResult = h({ messages: contextMsgs }, {});
+		}
+		assert.ok(ctxResult, "context should return modified messages");
+		const strippedText = ctxResult.messages[0].content
+			.filter((b: any) => typeof b.text === "string")
+			.map((b: any) => b.text)
+			.join("\n");
+		assert.ok(!strippedText.includes("[pi-sift scoring task]"), "start marker stripped");
+		assert.ok(!strippedText.includes("[/pi-sift scoring task]"), "end marker stripped");
+		assert.ok(!strippedText.includes("toolCallIds to score:"), "instruction body stripped");
+		assert.ok(strippedText.includes("before"), "text before block preserved");
+		assert.ok(strippedText.includes("after"), "text after block preserved");
+	});
+
+	it("does not fallback on tool-call-only turns; falls back after two text turns without decisions", async () => {
 		const { default: piSift } = await import("./index.js");
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 		const appended: Array<{ type: string; data: unknown }> = [];
@@ -257,25 +384,42 @@ describe("Mode A inline scoring flow", () => {
 			}, {});
 		}
 
-		const assistantMsg1 = {
+		const assistantToolOnly1 = {
 			role: "assistant",
 			content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "foo.py" } }],
 		};
 		for (const h of handlers.get("message_end") || []) {
-			h({ message: assistantMsg1 }, {});
+			h({ message: assistantToolOnly1 }, {});
 		}
-		// After 1 assistant message, fallback should NOT fire yet (context hook needs a turn)
-		assert.equal(appended.length, 0);
+		assert.equal(appended.length, 0, "no fallback after first tool-call-only turn");
 
-		const assistantMsg2 = {
+		const assistantToolOnly2 = {
 			role: "assistant",
 			content: [{ type: "toolCall", id: "c2", name: "read", arguments: { path: "bar.py" } }],
 		};
 		for (const h of handlers.get("message_end") || []) {
-			h({ message: assistantMsg2 }, {});
+			h({ message: assistantToolOnly2 }, {});
+		}
+		assert.equal(appended.length, 0, "no fallback after second tool-call-only turn");
+
+		const assistantText1 = {
+			role: "assistant",
+			content: [{ type: "text", text: "Working on it." }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantText1 }, {});
+		}
+		assert.equal(appended.length, 0, "no fallback after first text turn");
+
+		const assistantText2 = {
+			role: "assistant",
+			content: [{ type: "text", text: "Still working." }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantText2 }, {});
 		}
 
-		assert.equal(appended.length, 1);
+		assert.equal(appended.length, 1, "fallback should trigger on second text turn");
 		const decision = appended[0].data as any;
 		assert.equal(decision.toolCallId, "tc-auto-1");
 		assert.equal(decision.action, "keep");
@@ -288,8 +432,131 @@ describe("Mode A inline scoring flow", () => {
 		for (const h of handlers.get("context") || []) {
 			ctxResult = h({ messages: contextMsgs }, {});
 		}
-		assert.equal(ctxResult, undefined);
+		// Context hook canonicalizes compound toolCallId → short form
+		assert.equal((contextMsgs[0] as any).toolCallId, "tc-auto-1");
 		assert.equal((contextMsgs[0] as any).content[0].text.length, 6000);
+	});
+
+	it("canonicalizes compound toolCallIds in context so scoring prompt IDs match", async () => {
+		// Some providers (e.g. Codex) use compound IDs like "call_X|fc_Y".
+		// The scoring prompt uses the canonical short form ("call_X").
+		// The context hook must rewrite both toolCall and toolResult IDs
+		// so the model sees consistent short IDs it can match to the prompt.
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry() {},
+		};
+		piSift(fakePi as any);
+
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		// Mark a large tool result with a compound ID
+		const compoundId = "tc-canon|fc_0123456789abcdef";
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				toolName: "read",
+				toolCallId: compoundId,
+				input: { path: "/src/big.py" },
+				content: [{ type: "text", text: "x".repeat(6000) }],
+				isError: false,
+			}, {});
+		}
+
+		// Simulate an assistant turn with a toolCall block using the compound ID,
+		// followed by a toolResult with the same compound ID
+		const contextMsgs: any[] = [
+			{ role: "user", content: [{ type: "text", text: "do something" }] },
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: compoundId, name: "read", arguments: { path: "/src/big.py" } },
+				],
+			},
+			{ role: "toolResult", toolCallId: compoundId, content: [{ type: "text", text: "x".repeat(6000) }] },
+		];
+
+		let ctxResult: any;
+		for (const h of handlers.get("context") || []) {
+			ctxResult = h({ messages: contextMsgs }, {});
+		}
+
+		// Both sides should be canonicalized to "tc-canon"
+		assert.equal(contextMsgs[1].content[0].id, "tc-canon");
+		assert.equal(contextMsgs[2].toolCallId, "tc-canon");
+		// Should signal changes were made
+		assert.ok(ctxResult?.messages);
+
+		// Verify simple IDs (like Claude's toolu_XXX) pass through unchanged
+		const simpleMsgs: any[] = [
+			{ role: "assistant", content: [{ type: "toolCall", id: "toolu_abc123", name: "read" }] },
+			{ role: "toolResult", toolCallId: "toolu_abc123", content: [{ type: "text", text: "small" }] },
+		];
+		let simpleResult: any;
+		for (const h of handlers.get("context") || []) {
+			simpleResult = h({ messages: simpleMsgs }, {});
+		}
+		assert.equal(simpleMsgs[0].content[0].id, "toolu_abc123");
+		assert.equal(simpleMsgs[1].toolCallId, "toolu_abc123");
+	});
+
+	it("ignores unknown toolCallId decisions and injects a one-shot reminder", async () => {
+		const { default: piSift } = await import("./index.js");
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		const appended: Array<{ type: string; data: unknown }> = [];
+		const fakePi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (!handlers.has(event)) handlers.set(event, []);
+				handlers.get(event)!.push(handler);
+			},
+			registerCommand() {},
+			appendEntry(customType: string, data: unknown) { appended.push({ type: customType, data }); },
+		};
+		piSift(fakePi as any);
+
+		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
+
+		for (const h of handlers.get("tool_result") || []) {
+			h({
+				type: "tool_result",
+				toolCallId: "tc-known|fc_suffix",
+				toolName: "read",
+				input: { path: "/tmp/huge.py" },
+				content: [{ type: "text", text: "x".repeat(6000) }],
+				isError: false,
+			}, {});
+		}
+
+		const assistantMsg = {
+			role: "assistant",
+			content: [{ type: "text", text: '<context_lens>{"toolCallId":"tc-unknown","action":"summarize","summary":"bad"}</context_lens>' }],
+		};
+		for (const h of handlers.get("message_end") || []) {
+			h({ message: assistantMsg }, {});
+		}
+		assert.equal(appended.length, 0, "unknown toolCallId decision should be ignored");
+
+		const msgs = [
+			{ role: "user", content: [{ type: "text", text: "continue" }] },
+			{ role: "toolResult", toolCallId: "tc-known|fc_suffix", content: [{ type: "text", text: "x".repeat(6000) }] },
+		];
+		let ctxResult: any;
+		for (const h of handlers.get("context") || []) {
+			ctxResult = h({ messages: msgs }, {});
+		}
+		assert.ok(ctxResult, "context should be modified");
+
+		const userText = ctxResult.messages[0].content
+			.filter((b: any) => b?.type === "text")
+			.map((b: any) => b.text)
+			.join("\n");
+		assert.ok(userText.includes("[pi-sift reminder]"), "should inject invalid-id reminder");
+		assert.ok(userText.includes("toolCallIds to score: tc-known"), "should still inject scoring instruction");
 	});
 });
 
@@ -465,8 +732,8 @@ describe("keepLines in summarize flow", () => {
 		assert.ok(ctxResult);
 		const replaced = ctxResult.messages[0].content[0].text;
 		assert.ok(replaced.includes("200-line Python file with utils."), "summary present");
-		assert.ok(replaced.includes("--- kept lines 1-3 ---"), "kept lines 1-3 section present");
-		assert.ok(replaced.includes("--- kept lines 100-102 ---"), "kept lines 100-102 section present");
+		assert.ok(replaced.includes("--- kept lines 1-3 (verbatim, do not re-read) ---"), "kept lines 1-3 section present");
+		assert.ok(replaced.includes("--- kept lines 100-102 (verbatim, do not re-read) ---"), "kept lines 100-102 section present");
 		assert.ok(replaced.includes("line 1 content"), "line 1 preserved");
 		assert.ok(replaced.includes("line 3 content"), "line 3 preserved");
 		assert.ok(replaced.includes("line 100 content"), "line 100 preserved");
@@ -490,7 +757,7 @@ describe("keepLines in summarize flow", () => {
 		for (const h of handlers.get("session_start") || []) h({}, { sessionManager: { getBranch: () => [] } });
 
 		const plainLines: string[] = [];
-		for (let i = 1; i <= 50; i++) plainLines.push(`content of line ${i}${"x".repeat(30)}`);
+		for (let i = 1; i <= 50; i++) plainLines.push(`content of line ${i}${"x".repeat(130)}`);
 		const bigContent = plainLines.join("\n");
 		for (const h of handlers.get("tool_result") || []) {
 			h({ type: "tool_result", toolCallId: "tc-numbered", toolName: "read",
@@ -566,7 +833,7 @@ describe("keepLines in summarize flow", () => {
 		const replaced = contextMsgs[0].content[0].text;
 
 		// Header should show file line numbers
-		assert.ok(replaced.includes("--- kept lines 202-204 ---"), "header shows file line numbers");
+		assert.ok(replaced.includes("--- kept lines 202-204 (verbatim, do not re-read) ---"), "header shows file line numbers");
 		// Content should be file lines 202, 203, 204 (0-indexed: lines at index 2, 3, 4 of the result)
 		assert.ok(replaced.includes("file line 202 content"), "kept line 202 present");
 		assert.ok(replaced.includes("file line 203 content"), "kept line 203 present");
@@ -644,6 +911,7 @@ describe("buildScoringInstruction mentions keepLines", () => {
 		]);
 		assert.ok(instruction.includes("keepLines"), "scoring prompt should mention keepLines");
 		assert.ok(instruction.includes("[start,end]"), "scoring prompt should describe keepLines format");
+		assert.ok(instruction.includes("Only use toolCallIds"), "scoring prompt should forbid invented toolCallIds");
 	});
 });
 

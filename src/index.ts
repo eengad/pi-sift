@@ -20,6 +20,8 @@ interface LensDecision {
 	summary?: string;
 	keepLines?: [number, number][];
 	lineOffset?: number; // 1-based starting file line number (default 1 for full reads)
+	lineCount?: number; // number of lines in the original tool result
+	path?: string; // file path from the original tool call
 	cachedReplacement?: string;
 	timestamp: number;
 }
@@ -30,6 +32,7 @@ interface PendingDecision {
 	size: number;
 	path?: string;
 	lineOffset?: number; // 1-based starting file line number for offset reads
+	lineCount?: number; // number of lines in the original tool result
 	assistantMessagesSinceMarked: number;
 	instructionInjected: boolean;
 }
@@ -37,7 +40,10 @@ interface PendingDecision {
 interface MessageTextBlock {
 	type?: string;
 	text?: string;
+	[key: string]: unknown;
 }
+
+type TextLikeBlock = MessageTextBlock & { text: string };
 
 const DEFAULT_CONFIG: LensConfig = {
 	enabled: true,
@@ -52,7 +58,12 @@ const DEFAULT_CONFIG: LensConfig = {
 // files. Do NOT rename them — it would break existing sessions on reload.
 const CUSTOM_ENTRY_TYPE = "context_lens_decision";
 const BLOCK_REGEX = /<context_lens>([\s\S]*?)<\/context_lens>/g;
+const SCORING_TASK_START = "[pi-sift scoring task]";
+const SCORING_TASK_END = "[/pi-sift scoring task]";
+const INVALID_TOOLCALL_ID_REMINDER = "[pi-sift reminder] A previous <context_lens> decision used an invalid toolCallId. Use only the listed toolCallIds exactly; unknown IDs are ignored.";
 
+const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const SCORING_TASK_BLOCK_REGEX = new RegExp(`${escapeRegex(SCORING_TASK_START)}[\\s\\S]*?${escapeRegex(SCORING_TASK_END)}`, "g");
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
@@ -129,8 +140,96 @@ const parseDecisionsFromText = (text: string): LensDecision[] => {
 	return decisions;
 };
 
-const stripBlocks = (text: string): string =>
-	text.replace(BLOCK_REGEX, "").replace(/\n{3,}/g, "\n\n").trim();
+const isLegacyScoringInstructionLine = (trimmed: string): boolean => {
+	if (trimmed === "") return true;
+	if (trimmed.startsWith("Emit one")) return true;
+	if (trimmed === "Actions:") return true;
+	if (trimmed.startsWith("- keep:")) return true;
+	if (trimmed.startsWith("- summarize:")) return true;
+	if (trimmed.startsWith("Prefer summarize over keep")) return true;
+	if (trimmed.startsWith("Tool results are line-numbered")) return true;
+	if (trimmed.startsWith("Only use toolCallIds")) return true;
+	if (trimmed.startsWith("Format: <context_lens>")) return true;
+	if (trimmed.startsWith("toolCallIds to score:")) return true;
+	if (/^- [^:]+: .* \(\d+ chars\)$/.test(trimmed)) return true;
+	return false;
+};
+
+const stripLegacyScoringTaskBlocks = (text: string): string => {
+	const lines = text.split("\n");
+	const kept: string[] = [];
+	let changed = false;
+
+	for (let i = 0; i < lines.length; i++) {
+		if (lines[i].trim() !== SCORING_TASK_START) {
+			kept.push(lines[i]);
+			continue;
+		}
+		changed = true;
+		i++;
+		while (i < lines.length && isLegacyScoringInstructionLine(lines[i].trim())) i++;
+		i--;
+	}
+
+	return changed ? kept.join("\n") : text;
+};
+
+const stripBlocks = (text: string): string => {
+	const withoutLensBlocks = text.replace(BLOCK_REGEX, "");
+	const withoutScoringBlocks = withoutLensBlocks.replace(SCORING_TASK_BLOCK_REGEX, "");
+	const withoutLegacyScoringBlocks = stripLegacyScoringTaskBlocks(withoutScoringBlocks);
+	return withoutLegacyScoringBlocks.replace(/\n{3,}/g, "\n\n").trim();
+};
+
+const isTextLikeBlock = (block: unknown): block is TextLikeBlock => {
+	if (!isObject(block)) return false;
+	if (typeof block.text !== "string") return false;
+	return block.type !== "thinking";
+};
+
+const extractTextLikeContent = (content: MessageTextBlock[]): string => {
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isTextLikeBlock(block)) continue;
+		parts.push(block.text);
+	}
+	return parts.join("\n");
+};
+
+const stripBlocksFromTextRuns = (content: MessageTextBlock[]): { changed: boolean; blocks: MessageTextBlock[] } => {
+	const blocks: MessageTextBlock[] = [];
+	let changed = false;
+
+	for (let i = 0; i < content.length; ) {
+		if (!isTextLikeBlock(content[i])) {
+			blocks.push(content[i]);
+			i++;
+			continue;
+		}
+
+		const run: TextLikeBlock[] = [];
+		let j = i;
+		while (j < content.length) {
+			const block = content[j];
+			if (!isTextLikeBlock(block)) break;
+			run.push(block);
+			j++;
+		}
+
+		const joined = run.map((block) => block.text).join("\n");
+		const stripped = stripBlocks(joined);
+		if (stripped === joined) {
+			blocks.push(...run);
+		} else {
+			changed = true;
+			if (stripped !== "") blocks.push({ ...run[0], text: stripped });
+		}
+
+		i = j;
+	}
+
+	return { changed, blocks };
+};
 
 const loadConfig = (): LensConfig => {
 	// Also check legacy config path for backwards compatibility
@@ -177,7 +276,7 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 		.join("\n");
 
 	return [
-		"[pi-sift scoring task]",
+		SCORING_TASK_START,
 		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
 		"",
 		"Actions:",
@@ -186,11 +285,13 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 		"",
 		"Prefer summarize over keep — keeping costs tokens every turn.",
 		"Tool results are line-numbered (N<tab>content). Use line numbers for keepLines ranges.",
+		"Only use toolCallIds from the list below exactly as written. Do not invent or alter IDs; unknown IDs are invalid and will be ignored.",
 		"",
 		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize\",\"summary\":\"...\",\"keepLines\":[[start,end],...]}</context_lens>",
 		"",
 		`toolCallIds to score: ${idList}`,
 		itemLines,
+		SCORING_TASK_END,
 	].join("\n");
 };
 
@@ -203,6 +304,7 @@ export default function piSift(pi: ExtensionAPI) {
 	let totalCharsSaved = 0;
 	let decisionsAppliedCount = 0;
 	let hasMarkedResults = false;
+	let invalidToolCallIdReminderPending = false;
 	const readFileToolCallIds = new Map<string, { id: string; isFullRead: boolean }>(); // path → info
 
 	const rebuildDecisions = (ctx: {
@@ -215,6 +317,7 @@ export default function piSift(pi: ExtensionAPI) {
 		currentTurn = 0;
 		totalCharsSaved = 0;
 		decisionsAppliedCount = 0;
+		invalidToolCallIdReminderPending = false;
 
 		const branch = ctx.sessionManager.getBranch();
 		for (const entry of branch) {
@@ -333,6 +436,9 @@ export default function piSift(pi: ExtensionAPI) {
 		const lineOffset = (isObject(event.input) && typeof event.input.offset === "number" && event.input.offset > 0)
 			? event.input.offset : 1;
 
+		const text = extractText(event.content);
+		const lineCount = text.split("\n").length;
+
 		const canonicalId = canonicalToolCallId(event.toolCallId);
 		pendingDecisions.set(canonicalId, {
 			toolCallId: canonicalId,
@@ -340,6 +446,7 @@ export default function piSift(pi: ExtensionAPI) {
 			size,
 			path,
 			lineOffset: lineOffset > 1 ? lineOffset : undefined,
+			lineCount,
 			assistantMessagesSinceMarked: 0,
 			instructionInjected: false,
 		});
@@ -347,27 +454,57 @@ export default function piSift(pi: ExtensionAPI) {
 		hasMarkedResults = true;
 		console.error(`[pi-sift] marking tool_result id=${event.toolCallId} size=${size}`);
 
-		const text = extractText(event.content);
 		// Add line numbers using file line numbers so the model can make accurate keepLines selections
 		const numbered = text.split("\n").map((line, i) => `${lineOffset + i}\t${line}`).join("\n");
 		return { content: [{ type: "text" as const, text: numbered }] };
 	});
 
 	// Parse and strip <context_lens> blocks from assistant messages, persist decisions.
-	// Also apply a deterministic fallback so tool-call-only loops still get decisions.
+	// Also apply a deterministic fallback after text-bearing assistant turns when no
+	// model decision arrives.
 	pi.on("message_end", (event) => {
 		if (!config.enabled) return;
 		if (event.message.role !== "assistant") return;
 
 		const persistDecision = (decision: LensDecision) => {
 			const canonicalId = canonicalToolCallId(decision.toolCallId);
-			// Carry lineOffset from the pending decision (not emitted by the model)
 			const pending = pendingDecisions.get(canonicalId);
+			const existing = decisions.get(canonicalId);
+
+			if (!pending && !existing) {
+				invalidToolCallIdReminderPending = true;
+				console.error(`[pi-sift] ignored decision with unknown toolCallId=${canonicalId} action=${decision.action}`);
+				return;
+			}
+
+			// Carry lineOffset, lineCount, and path from pending decision (not emitted
+			// by model) or from existing decision (when model updates an already-known
+			// toolCallId). These are used to build accurate replacement headers.
 			const normalized: LensDecision = {
 				...decision,
 				toolCallId: canonicalId,
 				timestamp: decision.timestamp || Date.now(),
-				...(pending?.lineOffset ? { lineOffset: pending.lineOffset } : {}),
+				...(
+					pending?.lineOffset
+						? { lineOffset: pending.lineOffset }
+						: existing?.lineOffset
+							? { lineOffset: existing.lineOffset }
+							: {}
+				),
+				...(
+					pending?.lineCount
+						? { lineCount: pending.lineCount }
+						: existing?.lineCount
+							? { lineCount: existing.lineCount }
+							: {}
+				),
+				...(
+					pending?.path
+						? { path: pending.path }
+						: existing?.path
+							? { path: existing.path }
+							: {}
+				),
 			};
 			decisions.set(canonicalId, normalized);
 			pendingDecisions.delete(canonicalId);
@@ -379,15 +516,16 @@ export default function piSift(pi: ExtensionAPI) {
 		};
 
 		const content = event.message.content;
+		let hasAssistantText = false;
 		if (typeof content === "string") {
 			const parsed = parseDecisionsFromText(content);
 			for (const decision of parsed) persistDecision(decision);
+			hasAssistantText = stripBlocks(content).length > 0;
 		} else if (Array.isArray(content)) {
-			for (const block of content as MessageTextBlock[]) {
-				if (block?.type !== "text" || typeof block.text !== "string") continue;
-				const parsed = parseDecisionsFromText(block.text);
-				for (const decision of parsed) persistDecision(decision);
-			}
+			const textLike = extractTextLikeContent(content as MessageTextBlock[]);
+			const parsed = parseDecisionsFromText(textLike);
+			for (const decision of parsed) persistDecision(decision);
+			hasAssistantText = stripBlocks(textLike).length > 0;
 		}
 
 		for (const [id, pending] of pendingDecisions) {
@@ -396,13 +534,16 @@ export default function piSift(pi: ExtensionAPI) {
 				continue;
 			}
 
-			pending.assistantMessagesSinceMarked += 1;
+			if (hasAssistantText) pending.assistantMessagesSinceMarked += 1;
 			if (pending.assistantMessagesSinceMarked < 2) continue;
 
 			const fallbackDecision: LensDecision = {
 				toolCallId: id,
 				action: "keep",
 				timestamp: Date.now(),
+				...(pending.lineOffset ? { lineOffset: pending.lineOffset } : {}),
+				...(pending.lineCount ? { lineCount: pending.lineCount } : {}),
+				...(pending.path ? { path: pending.path } : {}),
 			};
 			decisions.set(id, fallbackDecision);
 			pendingDecisions.delete(id);
@@ -419,19 +560,9 @@ export default function piSift(pi: ExtensionAPI) {
 				(event.message as any).content = [{ type: "text", text: stripped }];
 			}
 		} else if (Array.isArray(content)) {
-			let blockChanged = false;
-			for (const block of content as MessageTextBlock[]) {
-				if (block?.type !== "text" || typeof block.text !== "string") continue;
-				const stripped = stripBlocks(block.text);
-				if (stripped !== block.text) {
-					block.text = stripped;
-					blockChanged = true;
-				}
-			}
-			if (blockChanged) {
-				(event.message as any).content = (content as unknown as MessageTextBlock[]).filter(
-					(block) => block.type !== "text" || (typeof block.text === "string" && block.text !== ""),
-				);
+			const stripped = stripBlocksFromTextRuns(content as MessageTextBlock[]);
+			if (stripped.changed) {
+				(event.message as any).content = stripped.blocks;
 			}
 		}
 	});
@@ -445,65 +576,94 @@ export default function piSift(pi: ExtensionAPI) {
 		let changed = false;
 		let decisionsAppliedThisPass = false;
 
-		// Strip <context_lens> blocks from all assistant messages.
-		// For the last assistant message, only strip from text blocks (not thinking blocks)
-		// to preserve Anthropic API thinking block integrity validation.
+		// Strip <context_lens> blocks from all assistant messages AND canonicalize
+		// tool call IDs so the model sees the same short form used in scoring prompts.
+		//
+		// Why canonicalize? Some providers (e.g. OpenAI Codex) use compound IDs like
+		// "call_XXX|fc_YYY" in toolCall/toolResult pairs. We store decisions under the
+		// canonical prefix ("call_XXX") and use that form in scoring instructions.
+		// Without rewriting the IDs in context, the model sees the full compound form
+		// in the conversation but the short form in the scoring prompt, fails to match
+		// them, and silently skips scoring. For providers with simple IDs (e.g. Claude's
+		// "toolu_XXX") this is a no-op since canonicalToolCallId returns them unchanged.
 		for (let i = 0; i < event.messages.length; i++) {
 			const msg = event.messages[i];
-			if (!isObject(msg) || msg.role !== "assistant") continue;
-			const content = msg.content;
-			if (typeof content === "string") {
-				const stripped = stripBlocks(content);
-				if (stripped !== content) {
-					msg.content = [{ type: "text", text: stripped }];
-					changed = true;
-				}
-			} else if (Array.isArray(content)) {
-				let blockChanged = false;
-				for (const block of content as MessageTextBlock[]) {
-					if (block?.type !== "text" || typeof block.text !== "string") continue;
-					const stripped = stripBlocks(block.text);
-					if (stripped !== block.text) {
-						block.text = stripped;
-						blockChanged = true;
+			if (!isObject(msg)) continue;
+
+			if (msg.role === "assistant") {
+				const content = msg.content;
+				if (typeof content === "string") {
+					const stripped = stripBlocks(content);
+					if (stripped !== content) {
+						msg.content = [{ type: "text", text: stripped }];
+						changed = true;
+					}
+				} else if (Array.isArray(content)) {
+					const stripped = stripBlocksFromTextRuns(content as MessageTextBlock[]);
+					if (stripped.changed) {
+						msg.content = stripped.blocks as unknown as typeof msg.content;
+						changed = true;
+					}
+					// Canonicalize toolCall IDs in assistant content blocks
+					for (const block of msg.content as MessageTextBlock[]) {
+						if (block?.type === "toolCall" && typeof block.id === "string") {
+							const canonical = canonicalToolCallId(block.id);
+							if (canonical !== block.id) {
+								block.id = canonical;
+								changed = true;
+							}
+						}
 					}
 				}
-				if (blockChanged) {
-					// Remove empty text blocks that resulted from stripping
-					msg.content = (content as unknown as MessageTextBlock[]).filter(
-						(block) => block.type !== "text" || (typeof block.text === "string" && block.text !== ""),
-					) as unknown as typeof msg.content;
-					changed = true;
+			} else if (msg.role === "toolResult") {
+				// Canonicalize the matching toolResult toolCallId
+				if (typeof msg.toolCallId === "string") {
+					const canonical = canonicalToolCallId(msg.toolCallId);
+					if (canonical !== msg.toolCallId) {
+						msg.toolCallId = canonical;
+						changed = true;
+					}
 				}
 			}
 		}
 
-		const toPrompt = Array.from(pendingDecisions.values()).filter((pending) => !pending.instructionInjected);
-		if (toPrompt.length > 0) {
-			const instruction = buildScoringInstruction(toPrompt);
-			// Append to the last user message instead of pushing a new one,
-			// so the scoring instruction doesn't leak as a visible message in the TUI.
+		const appendToLastUserMessage = (text: string) => {
 			let injected = false;
 			for (let i = event.messages.length - 1; i >= 0; i--) {
 				const msg = event.messages[i];
 				if (!isObject(msg) || msg.role !== "user") continue;
 				const content = msg.content;
 				if (typeof content === "string") {
-					msg.content = [{ type: "text", text: content }, { type: "text", text: instruction }];
+					msg.content = [{ type: "text", text: content }, { type: "text", text }];
 				} else if (Array.isArray(content)) {
-					(content as MessageTextBlock[]).push({ type: "text", text: instruction });
+					(content as MessageTextBlock[]).push({ type: "text", text });
+				} else {
+					msg.content = [{ type: "text", text }];
 				}
 				injected = true;
 				break;
 			}
 			if (!injected) {
-				// Fallback: no user message found, push one (shouldn't happen in practice)
 				event.messages.push({
 					role: "user",
-					content: [{ type: "text", text: instruction }],
+					content: [{ type: "text", text }],
 					timestamp: Date.now(),
 				});
 			}
+		};
+
+		if (invalidToolCallIdReminderPending) {
+			appendToLastUserMessage(INVALID_TOOLCALL_ID_REMINDER);
+			invalidToolCallIdReminderPending = false;
+			changed = true;
+		}
+
+		const toPrompt = Array.from(pendingDecisions.values()).filter((pending) => !pending.instructionInjected);
+		if (toPrompt.length > 0) {
+			const instruction = buildScoringInstruction(toPrompt);
+			// Append to the last user message instead of pushing a new one,
+			// so scoring instructions remain invisible as standalone chat messages.
+			appendToLastUserMessage(instruction);
 			for (const pending of toPrompt) pending.instructionInjected = true;
 			changed = true;
 		}
@@ -533,20 +693,33 @@ export default function piSift(pi: ExtensionAPI) {
 			} else if (decision.cachedReplacement) {
 				replacement = decision.cachedReplacement;
 			} else {
-				const baseSummary = decision.summary || "[pi-sift: summarized]";
+				// Build a source header so the model knows exactly which file/lines
+				// this replacement covers, even if the model's summary is inaccurate.
+				const firstLine = decision.lineOffset || 1;
+				const lastLine = decision.lineCount ? firstLine + decision.lineCount - 1 : undefined;
+				const sourceDesc = decision.path
+					? `${decision.path}${lastLine ? ` lines ${firstLine}-${lastLine}` : ""}`
+					: undefined;
+				const sourceHeader = sourceDesc ? `[pi-sift summarized: ${sourceDesc}]` : "[pi-sift: summarized]";
+				const modelSummary = decision.summary || "";
+
 				if (decision.keepLines && decision.keepLines.length > 0) {
 					const originalText = extractText(msg.content);
-					const firstLine = decision.lineOffset || 1;
 					const sections: string[] = [];
 					for (const [start, end] of decision.keepLines) {
 						const raw = extractLineRange(originalText, [[start, end]], firstLine);
-						if (raw) sections.push(`--- kept lines ${start}-${end} ---\n${stripLineNumbers(raw)}`);
+						if (raw) sections.push(`--- kept lines ${start}-${end} (verbatim, do not re-read) ---\n${stripLineNumbers(raw)}`);
 					}
+					const header = modelSummary
+						? `${sourceHeader}\n${modelSummary}`
+						: sourceHeader;
 					replacement = sections.length > 0
-						? `${baseSummary}\n\n${sections.join("\n\n")}`
-						: baseSummary;
+						? `${header}\n\n${sections.join("\n\n")}`
+						: header;
 				} else {
-					replacement = baseSummary;
+					replacement = modelSummary
+						? `${sourceHeader}\n${modelSummary}`
+						: sourceHeader;
 				}
 				decision.cachedReplacement = replacement;
 			}
