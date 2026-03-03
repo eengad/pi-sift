@@ -68,6 +68,12 @@ const extractText = (content: unknown): string => {
 
 const extractTextLength = (content: unknown): number => extractText(content).length;
 
+const stripLineNumbers = (text: string): string =>
+	text.split("\n").map(line => {
+		const tab = line.indexOf("\t");
+		return (tab !== -1 && /^\d+$/.test(line.slice(0, tab))) ? line.slice(tab + 1) : line;
+	}).join("\n");
+
 const extractLineRange = (text: string, ranges: [number, number][]): string => {
 	const lines = text.split("\n");
 	const kept: string[] = [];
@@ -96,7 +102,7 @@ const parseDecisionPayload = (payload: unknown): LensDecision | null => {
 	if (!isObject(payload)) return null;
 	const { toolCallId, action, summary, keepLines } = payload;
 	if (typeof toolCallId !== "string") return null;
-	if (action !== "keep" && action !== "summarize" && action !== "dismiss") return null;
+	if (action !== "keep" && action !== "summarize") return null;
 	if (summary !== undefined && typeof summary !== "string") return null;
 	if (keepLines !== undefined && !isValidKeepLines(keepLines)) return null;
 	const decision: LensDecision = { toolCallId, action, summary, timestamp: Date.now() };
@@ -170,16 +176,15 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 	return [
 		"[pi-sift scoring task]",
 		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
-		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize|dismiss\",\"summary\":\"...\",\"keepLines\":[[start,end],...]}</context_lens>",
-		"",
-		"Tool results are line-numbered (N<tab>content). Use these numbers for keepLines ranges.",
 		"",
 		"Actions:",
-		"- keep: full content should stay.",
-		"- summarize: compress to 2-4 lines. Use keepLines with [start,end] line ranges to preserve critical code verbatim — these lines stay in context, no need to re-read them.",
-		"- dismiss: not relevant (one-line reason).",
+		"- keep: full content stays in context.",
+		"- summarize: replace with a summary. Use keepLines:[[start,end],...] to preserve specific line ranges verbatim — include any lines you may need later.",
 		"",
-		"Prefer summarize or dismiss — keeping costs tokens every turn; re-reading is cheap.",
+		"Prefer summarize over keep — keeping costs tokens every turn.",
+		"Tool results are line-numbered (N<tab>content). Use line numbers for keepLines ranges.",
+		"",
+		"Format: <context_lens>{\"toolCallId\":\"...\",\"action\":\"keep|summarize\",\"summary\":\"...\",\"keepLines\":[[start,end],...]}</context_lens>",
 		"",
 		`toolCallIds to score: ${idList}`,
 		itemLines,
@@ -464,7 +469,20 @@ export default function piSift(pi: ExtensionAPI) {
 			if (!toolCallId) continue;
 
 			const decision = decisions.get(canonicalToolCallId(toolCallId));
-			if (!decision || decision.action === "keep") continue;
+			if (!decision) continue;
+
+			if (decision.action === "keep") {
+				// Strip scoring marker and N\t line numbers — not needed after scoring
+				const text = extractText(msg.content);
+				const markerEnd = text.indexOf(MARKER_PREFIX) === 0
+					? text.indexOf("\n\n", MARKER_PREFIX.length)
+					: -1;
+				if (markerEnd !== -1) {
+					msg.content = [{ type: "text", text: stripLineNumbers(text.slice(markerEnd + 2)) }];
+					changed = true;
+				}
+				continue;
+			}
 
 			let replacement: string;
 			if (decision.action === "dismiss") {
@@ -480,9 +498,13 @@ export default function piSift(pi: ExtensionAPI) {
 						? originalText.indexOf("\n\n", MARKER_PREFIX.length)
 						: -1;
 					if (markerEnd !== -1) originalText = originalText.slice(markerEnd + 2);
-					const keptText = extractLineRange(originalText, decision.keepLines);
-					replacement = keptText
-						? `${baseSummary}\n\n--- kept lines ---\n${keptText}`
+					const sections: string[] = [];
+					for (const [start, end] of decision.keepLines) {
+						const raw = extractLineRange(originalText, [[start, end]]);
+						if (raw) sections.push(`--- kept lines ${start}-${end} ---\n${stripLineNumbers(raw)}`);
+					}
+					replacement = sections.length > 0
+						? `${baseSummary}\n\n${sections.join("\n\n")}`
 						: baseSummary;
 				} else {
 					replacement = baseSummary;
@@ -505,4 +527,4 @@ export default function piSift(pi: ExtensionAPI) {
 }
 
 // Re-export helpers for testing
-export { extractTextLength, extractLineRange, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction };
+export { extractTextLength, extractLineRange, stripLineNumbers, parseDecisionPayload, parseDecisionsFromText, stripBlocks, extractText, buildScoringInstruction };

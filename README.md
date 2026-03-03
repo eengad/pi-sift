@@ -23,14 +23,18 @@ pi install https://github.com/eengad/pi-sift
 
 ## Benchmark results (SWE-ReBench, claude-opus-4-6, N=1 per task)
 
-| Task | Baseline tokens | Extension tokens | Δ tokens | Δ cost | Δ latency |
-|---|---|---|---|---|---|
-| pennylane-7671 | 91k | 69k | **-25%** | **-20%** | **-58%** |
-| haystack-9527 | 821k | 135k | **-83%** | **-41%** | **-72%** |
-| stellarphot-519 | 2,593k | 2,619k | +1% | +20% | +6% |
-| stellarphot-526 | 67k | 53k | **-20%** | +11% | **-12%** |
+Only tasks where pi-sift made at least one decision are shown — zero-decision runs are uninformative about the extension.
 
-Resolution unchanged (1/4 for both). Single runs — variance is possible, especially on task 3 (98 turns). Full results in [`benchmark-keeplines-results.md`](./benchmark-keeplines-results.md).
+| Instance | Decisions | B tokens | E tokens | Δ tokens | Δ cost | B tests | E tests |
+|---|---|---|---|---|---|---|---|
+| haystack-9527 | 1 | 204k | 151k | **-26%** | +31% | 25p/2f | 25p/2f |
+| sympy-28122 | 1 | 499k | 274k | **-45%** | **-24%** | 101p/0f ✓ | 101p/0f ✓ |
+| PyDough-368 | 6 | 4,075k | 2,649k | **-35%** | **-19%** | 127p/1f | 127p/1f |
+| avroschema-870 | 3 | 913k | 977k | +7% | +22% | 14p/0f ✓ | 14p/0f ✓ |
+| black-4676 | 1 | 53k | 71k | +34% | +81% | 144p/0f ✓ | 144p/0f ✓ |
+| fromager-626 | 1 | 281k | 229k | -18% | +9% | 7p/0f ✓ | 6p/1f |
+
+✓ = resolved. Single runs — variance applies, especially on 1-decision tasks. The three largest tasks (sympy, PyDough, haystack) show consistent token and cost reduction. black and fromager are likely noise: black's decision added overhead on a small task; fromager's decision fired at the last turn. Full results in [`benchmark-status.md`](./benchmark-status.md).
 
 ## Local development
 

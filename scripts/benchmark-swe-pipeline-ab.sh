@@ -14,7 +14,7 @@ MAX_PROBLEM_CHARS="${PI_BENCH_MAX_PROBLEM_CHARS:-6000}"
 RUN_TIMEOUT_SEC="${PI_BENCH_TIMEOUT_SEC:-900}"
 VERIFY_TIMEOUT_SEC="${PI_BENCH_VERIFY_TIMEOUT_SEC:-900}"
 WORK_ROOT="${PI_BENCH_WORK_ROOT:-$(mktemp -d ${PI_BENCH_TMPDIR:+-p "$PI_BENCH_TMPDIR"})}"
-KEEP_WORKDIR="${PI_BENCH_KEEP_WORKDIR:-0}"
+KEEP_WORKDIR="${PI_BENCH_KEEP_WORKDIR:-1}"
 CONFIGS="${PI_BENCH_CONFIGS:-baseline,extension}"
 
 SWE_REBENCH_URL="${PI_BENCH_SWE_REBENCH_URL:-https://github.com/DivyeshJayswal/SWE_ReBench.git}"
@@ -154,6 +154,9 @@ new_install = (
     '            if task.install_config.install:\n'
     '                install_cmd = task.install_config.install\n'
     '                used_constraints = False\n'
+    "                if install_cmd.startswith('poetry install'):\n"
+    '                    import re as _re\n'
+    "                    install_cmd = _re.sub(r'\\s+--with\\s+\\S+', '', install_cmd).strip()\n"
     "                if hasattr(task, 'docker_image') and task.docker_image and install_cmd.startswith('pip install'):\n"
     '                    try:\n'
     '                        constraints = self._extract_constraints(task.docker_image)\n'
@@ -200,6 +203,29 @@ code = code.replace(
 )
 open(path, 'w').write(code)
 PATCH_CONSTRAINTS
+  # Patch execution_env.py:
+  # 6. Install poetry in Dockerfile when install command requires it
+  python3 - "$SWE_REBENCH_DIR/execution_env.py" <<'PATCH_POETRY'
+import sys
+path = sys.argv[1]
+code = open(path).read()
+code = code.replace(
+    '        if task.install_config.pre_install:\n'
+    '            for cmd in task.install_config.pre_install:\n'
+    '                dockerfile += f"RUN {cmd}\\n"\n'
+    '        \n'
+    '        if task.install_config.pip_packages:',
+    '        if task.install_config.pre_install:\n'
+    '            for cmd in task.install_config.pre_install:\n'
+    '                dockerfile += f"RUN {cmd}\\n"\n'
+    '        \n'
+    '        if task.install_config.install and \'poetry\' in task.install_config.install:\n'
+    '            dockerfile += "RUN pip install poetry && poetry config virtualenvs.create false\\n"\n'
+    '        \n'
+    '        if task.install_config.pip_packages:'
+)
+open(path, 'w').write(code)
+PATCH_POETRY
 fi
 
 # Pull required task rows from HF dataset-server rows endpoint (supports pagination).
