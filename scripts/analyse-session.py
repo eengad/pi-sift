@@ -116,6 +116,39 @@ def analyse(entries):
             marker = " [SCORED]" if sz >= 5000 else ""
             print(f"  result: {sz}ch{marker}  ({tid})")
 
+    # --- Unscored large results ---
+    # A result is "unscored" if it was >= 5000 chars and the model never emitted
+    # a <context_lens> decision for it. Heuristic-only decisions (auto-dismiss on
+    # re-read/edit) don't count as model scoring — they mean the model ignored the
+    # scoring instruction and the extension cleaned up automatically.
+    canon = lambda tid: tid.split("|")[0] if tid else tid
+    model_scored_ids = {canon(d["toolCallId"]) for d in decisions if not d.get("heuristic")}
+    large_results = []
+    for e in entries:
+        if e.get("type") != "message":
+            continue
+        m = e.get("message", {})
+        if m.get("role") != "toolResult":
+            continue
+        tid = canon(m.get("toolCallId", ""))
+        content = m.get("content", [])
+        sz = 0
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    sz = len(b.get("text", ""))
+                    break
+        if sz >= 5000:
+            large_results.append({"id": tid, "size": sz, "model_scored": tid in model_scored_ids})
+
+    unscored = [r for r in large_results if not r["model_scored"]]
+    if unscored:
+        print()
+        print("=== UNSCORED LARGE RESULTS ===")
+        for r in unscored:
+            print(f"  {r['size']:>8} chars  id={r['id'][:30]}")
+        print(f"  {len(unscored)}/{len(large_results)} large results were not scored by model")
+
     # --- Usage summary ---
     print()
     print("=== USAGE ===")
@@ -149,6 +182,8 @@ def analyse(entries):
     print(f"  Total tokens:    {usage_total:,}")
     print(f"  Cost (USD):      ${cost_total:.4f}")
     print(f"  Decisions:       {custom_decisions}")
+    if large_results:
+        print(f"  Large results:   {len(large_results)} ({len(large_results) - len(unscored)} model-scored, {len(unscored)} unscored)")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "name": "pi-sift",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Model-scored compression of large tool results for Pi Coding Agent",
   "type": "module",
   "main": "dist/index.js",
@@ -11,8 +11,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "check:version-sync": "node ./scripts/check-version-sync.mjs",
     "test": "tsx --test src/index.test.ts src/validation.test.ts",
-    "validate": "npm run check && npm run test",
+    "validate": "npm run check:version-sync && npm run check && npm run test",
     "validate:real": "./scripts/validate-real-pi.sh",
     "benchmark:swe-pipeline-ab": "./scripts/benchmark-swe-pipeline-ab.sh",
     "analyse-session": "python3 ./scripts/analyse-session.py"
