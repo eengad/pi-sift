@@ -918,6 +918,14 @@ describe("buildScoringInstruction mentions keepLines", () => {
 		assert.ok(instruction.includes("[start,end]"), "scoring prompt should describe keepLines format");
 		assert.ok(instruction.includes("Only use toolCallIds"), "scoring prompt should forbid invented toolCallIds");
 	});
+
+	it("scoring prompt includes preamble identifying it as automated", () => {
+		const instruction = buildScoringInstruction([
+			{ toolCallId: "tc-1", toolName: "read", size: 5000, path: "/test.py", assistantMessagesSinceMarked: 0, instructionInjected: false },
+		]);
+		assert.ok(instruction.includes("This is not a user message"), "preamble should clarify this is not from a human");
+		assert.ok(instruction.includes("automated instruction"), "preamble should identify as automated");
+	});
 });
 
 // Helper to set up a fresh piSift instance with fakePi

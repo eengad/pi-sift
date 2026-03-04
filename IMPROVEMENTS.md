@@ -27,7 +27,9 @@ Raised from 2000 to 5000. Small targeted reads (agent already curated the range 
 
 ## Force scoring before continuing
 
-When the model ignores the scoring instruction (responds with only tool calls, no `<context_lens>` block), the large tool result sits unscored in context indefinitely. This was observed consistently with Codex 5.3 and occasionally with Opus 4.6.
+When the model ignores the scoring instruction (responds with only tool calls, no `<context_lens>` block), the large tool result sits unscored in context indefinitely. This was observed with Codex 5.3 (~67% of the time) and occasionally with Opus 4.6.
+
+Debug logging confirmed the instruction is delivered correctly: it arrives as a separate user message at the end of context with the full preamble and scoring prompt. Codex simply chooses not to follow it on some turns. No pattern by result size — a 51k read may be ignored while a 6k read is scored.
 
 The current fallback (apply `keep` after 2 text-bearing turns) rarely fires because most intermediate turns are tool-call-only, and `keep` provides no compression anyway.
 

@@ -16,6 +16,8 @@ VERIFY_TIMEOUT_SEC="${PI_BENCH_VERIFY_TIMEOUT_SEC:-900}"
 WORK_ROOT="${PI_BENCH_WORK_ROOT:-$(mktemp -d ${PI_BENCH_TMPDIR:+-p "$PI_BENCH_TMPDIR"})}"
 KEEP_WORKDIR="${PI_BENCH_KEEP_WORKDIR:-1}"
 CONFIGS="${PI_BENCH_CONFIGS:-baseline,extension}"
+THINKING="${PI_BENCH_THINKING:-}"
+SIFT_DEBUG="${PI_BENCH_SIFT_DEBUG:-1}"
 
 SWE_REBENCH_URL="${PI_BENCH_SWE_REBENCH_URL:-https://github.com/DivyeshJayswal/SWE_ReBench.git}"
 SWE_REBENCH_DIR="${PI_BENCH_SWE_REBENCH_DIR:-$WORK_ROOT/SWE_ReBench}"
@@ -340,21 +342,58 @@ PY
       git clean -fd >/dev/null 2>&1 || true
       git checkout "$BASE_COMMIT" >/dev/null 2>&1 || true
 
+      THINKING_FLAG=""
+      if [[ -n "$THINKING" ]]; then
+        THINKING_FLAG="--thinking $THINKING"
+      fi
+
+      # Enable pi-sift debug logging if requested
+      SIFT_CONFIG="$HOME/.pi/agent/pi-sift.json"
+      SIFT_CONFIG_BACKUP=""
+      if [[ "$SIFT_DEBUG" == "1" && "$config" == "extension" ]]; then
+        if [[ -f "$SIFT_CONFIG" ]]; then
+          SIFT_CONFIG_BACKUP="$(mktemp)"
+          cp "$SIFT_CONFIG" "$SIFT_CONFIG_BACKUP"
+        fi
+        # Merge debug:true into existing config or create one
+        python3 -c "
+import json, os
+path = '$SIFT_CONFIG'
+cfg = {}
+if os.path.exists(path):
+    try: cfg = json.load(open(path))
+    except: pass
+cfg['debug'] = True
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(cfg, open(path, 'w'))
+"
+      fi
+
+      STDERR_FILE="$RUN_DIR/stderr.log"
       start_ts=$(date +%s)
       run_rc=0
       if [[ "$config" == "extension" ]]; then
         timeout "${RUN_TIMEOUT_SEC}s" pi -p \
           --model "$MODEL" \
+          $THINKING_FLAG \
           --tools read,grep,find,ls,edit,write,bash \
           --session-dir "$SESSION_DIR" \
           -e "$ROOT_DIR/dist/index.js" \
-          "@${PROMPT_FILE}" >"$OUTPUT_FILE" 2>/dev/null || run_rc=$?
+          "@${PROMPT_FILE}" >"$OUTPUT_FILE" 2>"$STDERR_FILE" || run_rc=$?
       else
         timeout "${RUN_TIMEOUT_SEC}s" pi -p \
           --model "$MODEL" \
+          $THINKING_FLAG \
           --tools read,grep,find,ls,edit,write,bash \
           --session-dir "$SESSION_DIR" \
           "@${PROMPT_FILE}" >"$OUTPUT_FILE" 2>/dev/null || run_rc=$?
+      fi
+
+      # Restore pi-sift config
+      if [[ -n "$SIFT_CONFIG_BACKUP" ]]; then
+        mv "$SIFT_CONFIG_BACKUP" "$SIFT_CONFIG"
+      elif [[ "$SIFT_DEBUG" == "1" && "$config" == "extension" ]]; then
+        rm -f "$SIFT_CONFIG"
       fi
       end_ts=$(date +%s)
       elapsed=$((end_ts - start_ts))
@@ -434,36 +473,84 @@ session_files = sys.argv[10:]
 usage_in = usage_out = usage_total = 0
 cost_total = 0.0
 assistant_msgs = tool_results = custom_decisions = lens_blocks = 0
+large_results = 0
+decisions_keep = 0
+decisions_summarize = 0
+read_paths = []
+decision_details = []
+
+LARGE_THRESHOLD = 5000
 
 for session_file in session_files:
+    # First pass: build toolCallId -> path map from assistant toolCall blocks
+    toolcall_paths = {}
+    all_events = []
     with open(session_file) as f:
         for line in f:
             o = json.loads(line)
-            if o.get('type') == 'custom' and o.get('customType') == 'context_lens_decision':
-                custom_decisions += 1
+            all_events.append(o)
             if o.get('type') == 'message':
                 m = o.get('message', {})
-                role = m.get('role')
-                if role == 'assistant':
-                    assistant_msgs += 1
-                    u = m.get('usage') or {}
-                    usage_in += int(u.get('input', 0) or 0)
-                    usage_out += int(u.get('output', 0) or 0)
-                    usage_total += int(u.get('totalTokens', 0) or 0)
-                    c = (u.get('cost') or {}).get('total', 0) or 0
-                    try:
-                        cost_total += float(c)
-                    except Exception:
-                        pass
-                    content = m.get('content', [])
-                    if isinstance(content, str):
-                        lens_blocks += int('<context_lens>' in content)
-                    elif isinstance(content, list):
-                        for b in content:
-                            if isinstance(b, dict) and b.get('type') == 'text':
-                                lens_blocks += int('<context_lens>' in b.get('text', ''))
-                elif role == 'toolResult':
-                    tool_results += 1
+                if m.get('role') == 'assistant':
+                    for c in m.get('content', []):
+                        if isinstance(c, dict) and c.get('type') == 'toolCall':
+                            args = c.get('arguments', {})
+                            if 'path' in args:
+                                toolcall_paths[c.get('id', '')] = args['path']
+
+    # Second pass: collect metrics
+    for o in all_events:
+        if o.get('type') == 'custom' and o.get('customType') == 'context_lens_decision':
+            custom_decisions += 1
+            d = o.get('data', {})
+            action = d.get('action', '')
+            if action == 'keep':
+                decisions_keep += 1
+            elif action == 'summarize':
+                decisions_summarize += 1
+            decision_details.append({
+                'action': action,
+                'path': d.get('path', ''),
+                'lineCount': d.get('lineCount', 0),
+            })
+        if o.get('type') == 'message':
+            m = o.get('message', {})
+            role = m.get('role')
+            if role == 'assistant':
+                assistant_msgs += 1
+                u = m.get('usage') or {}
+                usage_in += int(u.get('input', 0) or 0)
+                usage_out += int(u.get('output', 0) or 0)
+                usage_total += int(u.get('totalTokens', 0) or 0)
+                c = (u.get('cost') or {}).get('total', 0) or 0
+                try:
+                    cost_total += float(c)
+                except Exception:
+                    pass
+                content = m.get('content', [])
+                if isinstance(content, str):
+                    lens_blocks += int('<context_lens>' in content)
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get('type') == 'text':
+                            lens_blocks += int('<context_lens>' in b.get('text', ''))
+            elif role == 'toolResult':
+                tool_results += 1
+                tool_name = m.get('toolName', '')
+                tool_call_id = m.get('toolCallId', '')
+                result_size = 0
+                for c in m.get('content', []):
+                    if isinstance(c, dict) and c.get('type') == 'text':
+                        result_size += len(c.get('text', ''))
+                if result_size >= LARGE_THRESHOLD:
+                    large_results += 1
+                if tool_name == 'read':
+                    path = toolcall_paths.get(tool_call_id, '')
+                    read_paths.append(path)
+
+from collections import Counter
+read_counts = Counter(read_paths)
+rereads = {p: c for p, c in read_counts.items() if c > 1}
 
 final = open(output_file).read().strip() if output_file else ""
 verify = json.load(open(verify_file))
@@ -483,6 +570,13 @@ obj = {
     'total_tokens': usage_total,
     'cost_usd': round(cost_total, 6),
     'custom_decisions': custom_decisions,
+    'decisions_keep': decisions_keep,
+    'decisions_summarize': decisions_summarize,
+    'decision_details': decision_details,
+    'large_results': large_results,
+    'unique_reads': len(set(read_paths)),
+    'total_reads': len(read_paths),
+    'rereads': rereads,
     'lens_blocks_left': lens_blocks,
     'ended_with_done': final.endswith('done'),
     'patch_chars': patch_chars,

@@ -32,7 +32,7 @@ Scoring runs in `mode: "piggyback"`, where the primary agent does scoring as par
 A separate model call is optional and only used in `mode: "external-model"`.
 
 **Mode A — Piggyback (zero-cost, recommended default)**
-- Scoring instructions are injected **conditionally, not permanently**. The `tool_result` hook marks results that exceed a character threshold (default: 5000 chars, configurable via `minCharsToScore`). Small files aren't worth the scoring overhead — a 50-line config file costs negligible context. The `context` hook checks for pending (unscored) results and appends a scoring instruction to the **last user message** (not as a separate message, to avoid TUI artifacts). This keeps the prompt clean during turns with no large tool results.
+- Scoring instructions are injected **conditionally, not permanently**. The `tool_result` hook marks results that exceed a character threshold (default: 5000 chars, configurable via `minCharsToScore`). Small files aren't worth the scoring overhead — a 50-line config file costs negligible context. The `context` hook checks for pending (unscored) results and pushes a scoring instruction as a **separate user message at the end of context**. The instruction includes a preamble ("This is not a user message. This is an automated instruction from the pi-sift extension.") to prevent the model from treating it as a human message. The `context` hook operates on a deep copy, so this message is ephemeral — not persisted to the session or visible in the TUI.
 - Marked tool results are line-numbered (e.g., `1\tfunction hello() {`) so the model can specify precise `keepLines` ranges. For offset reads (e.g., `read foo.py` starting at line 200), line numbers start from the file offset, not 1.
 - The injected instruction tells the agent to emit a structured `<context_lens>` block: `{action: "keep" | "summarize" | "dismiss", summary?: string, toolCallId: string, keepLines?: [[start, end], ...]}`
 - At `message_end` (for the assistant message), the extension:
@@ -126,7 +126,7 @@ Instructs the agent to:
 
 ### Phase 1 — Piggyback mode (V1) ✅ Done
 - `tool_result` → mark results exceeding `minCharsToScore`, add line numbers (offset-aware), track for heuristic dismiss
-- `context` → inject scoring instruction (appended to last user message) for pending results; apply decisions to cloned messages; strip `<context_lens>` blocks from all assistant messages
+- `context` → inject scoring instruction (as separate user message at end of context) for pending results; apply decisions to cloned messages; strip `<context_lens>` blocks from all assistant messages
 - `message_end` → parse `<context_lens>` block, **strip blocks in-place** (before TUI rendering and session persistence), record decision in Map (with `keepLines` and `lineOffset`), persist via `pi.appendEntry()`
 - `session_start` → rebuild decision Map from custom entries
 - Protect recently edited files (skip scoring for files written/edited within last N turns)
@@ -206,7 +206,7 @@ The `<context_lens>` block emitted by the agent in its response must be stripped
 
 **Flow (piggyback mode):**
 1. `tool_result` handler marks large results, adds offset-aware line numbers, tracks file paths for heuristic dismiss
-2. `context` handler appends scoring instruction to the last user message for any pending (unscored) results; also strips `<context_lens>` blocks from all assistant messages and applies decisions to tool results
+2. `context` handler pushes scoring instruction as a separate user message for any pending (unscored) results; also strips `<context_lens>` blocks from all assistant messages and applies decisions to tool results
 3. `message_end` handler parses the `<context_lens>` block from `event.message.content`, strips blocks **in-place** (before TUI rendering and session persistence), records `{ toolCallId, action, summary, keepLines, lineOffset }` in an in-memory decision Map
 4. Persists the decision via `pi.appendEntry("context_lens_decision", { toolCallId, action, summary, keepLines, lineOffset })` — this is a separate JSONL entry that survives session reload
 5. On future turns, `context` event handler replaces matching tool results in the cloned message array (with cached replacements for efficiency)

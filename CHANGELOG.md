@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+### Features
+
+- **Separate user message for scoring instruction.** Reverts to the pre-0.2.0 approach of pushing the scoring instruction as a separate user message instead of appending to the last user message. Testing confirmed the TUI leak that motivated the 0.2.0 change doesn't actually exist (the context hook operates on a deep copy). A preamble ("This is not a user message. This is an automated instruction from the pi-sift extension.") prevents the model from treating it as a human message.
+- **Debug logging.** New `debug` config flag (default `false`) enables diagnostic logging to stderr at 5 points: marking pending results, instruction injection, instruction content preview, message role sequence, and parsed decisions. Enable via `~/.pi/agent/pi-sift.json`: `{"debug": true}`.
+
+### Improvements
+
+- **Benchmark script enhancements.** `PI_BENCH_THINKING` env var for thinking level, `PI_BENCH_SIFT_DEBUG` env var (default `1`) for debug logging in extension runs, stderr capture to `stderr.log`, new result fields: `large_results`, `decisions_keep`, `decisions_summarize`, `decision_details`, `unique_reads`, `total_reads`, `rereads`.
+
+### Documentation
+
+- Updated README: scoring instruction is now a separate user message, replaced benchmark table with summary, Codex compatibility notes.
+- Updated DESIGN.md: reflects separate user message approach with preamble.
+- Updated IMPROVEMENTS.md: debug logging findings about Codex non-compliance.
+
 ## 0.3.0
 
 ### Features

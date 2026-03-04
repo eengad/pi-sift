@@ -12,6 +12,7 @@ interface LensConfig {
 	editedFileProtectionTurns: number;
 	dryRun: boolean;
 	stats: boolean;
+	debug: boolean;
 }
 
 interface LensDecision {
@@ -52,6 +53,7 @@ const DEFAULT_CONFIG: LensConfig = {
 	editedFileProtectionTurns: 4,
 	dryRun: false,
 	stats: true,
+	debug: false,
 };
 
 // NOTE: these protocol strings (XML tag, entry type, marker) are persisted in session
@@ -252,6 +254,7 @@ const loadConfig = (): LensConfig => {
 					: DEFAULT_CONFIG.editedFileProtectionTurns,
 			dryRun: typeof parsed.dryRun === "boolean" ? parsed.dryRun : DEFAULT_CONFIG.dryRun,
 			stats: typeof parsed.stats === "boolean" ? parsed.stats : DEFAULT_CONFIG.stats,
+			debug: typeof parsed.debug === "boolean" ? parsed.debug : DEFAULT_CONFIG.debug,
 		};
 	} catch {
 		return { ...DEFAULT_CONFIG };
@@ -277,6 +280,9 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 
 	return [
 		SCORING_TASK_START,
+		"This is not a user message. This is an automated instruction from the pi-sift extension.",
+		"Score the following tool results, then continue working on the user's task.",
+		"",
 		"Emit one <context_lens> JSON block for each listed toolCallId, then continue working on the task.",
 		"",
 		"Actions:",
@@ -293,6 +299,10 @@ const buildScoringInstruction = (items: PendingDecision[]): string => {
 		itemLines,
 		SCORING_TASK_END,
 	].join("\n");
+};
+
+const debugLog = (config: LensConfig, ...args: unknown[]) => {
+	if (config.debug) console.error(`[pi-sift debug]`, ...args);
 };
 
 export default function piSift(pi: ExtensionAPI) {
@@ -450,6 +460,7 @@ export default function piSift(pi: ExtensionAPI) {
 			assistantMessagesSinceMarked: 0,
 			instructionInjected: false,
 		});
+		debugLog(config, `marked pending: ${canonicalId} ${event.toolName} ${path ?? ""} (${size} chars)`);
 
 		hasMarkedResults = true;
 		console.error(`[pi-sift] marking tool_result id=${event.toolCallId} size=${size}`);
@@ -519,11 +530,13 @@ export default function piSift(pi: ExtensionAPI) {
 		let hasAssistantText = false;
 		if (typeof content === "string") {
 			const parsed = parseDecisionsFromText(content);
+			if (parsed.length > 0) debugLog(config, `parsed ${parsed.length} decisions from assistant text:`, parsed.map((d) => `${d.toolCallId} ${d.action}`).join(", "));
 			for (const decision of parsed) persistDecision(decision);
 			hasAssistantText = stripBlocks(content).length > 0;
 		} else if (Array.isArray(content)) {
 			const textLike = extractTextLikeContent(content as MessageTextBlock[]);
 			const parsed = parseDecisionsFromText(textLike);
+			if (parsed.length > 0) debugLog(config, `parsed ${parsed.length} decisions from assistant content:`, parsed.map((d) => `${d.toolCallId} ${d.action}`).join(", "));
 			for (const decision of parsed) persistDecision(decision);
 			hasAssistantText = stripBlocks(textLike).length > 0;
 		}
@@ -670,6 +683,10 @@ export default function piSift(pi: ExtensionAPI) {
 				timestamp: Date.now(),
 			});
 			for (const pending of toPrompt) pending.instructionInjected = true;
+			debugLog(config, `scoring instruction injected for ${toPrompt.length} items:`, toPrompt.map((p) => `${p.toolCallId} ${p.toolName} ${p.path ?? ""} (${p.size} chars)`).join(", "));
+			debugLog(config, `instruction (first 200 chars): ${instruction.slice(0, 200).replace(/\n/g, "\\n")}`);
+			const roles = event.messages.map((m) => (m as { role?: string }).role ?? "?");
+			debugLog(config, `message roles after injection:`, roles.join(", "));
 			changed = true;
 		}
 

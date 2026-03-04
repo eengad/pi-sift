@@ -4,7 +4,7 @@ A [Pi Coding Agent](https://github.com/nicepkg/pi-coding-agent) extension that p
 
 ## How it works
 
-1. When a tool result exceeds a size threshold, pi-sift appends a scoring prompt asking the model to decide: **keep** or **summarize**.
+1. When a tool result exceeds a size threshold, pi-sift injects a scoring instruction as a separate user message asking the model to decide: **keep** or **summarize**.
 2. On summarize, the model can specify `keepLines` — line ranges to preserve verbatim while compressing the rest.
 3. Before each API call, the context hook replaces scored content with the summary + kept lines.
 4. Heuristic dismiss auto-removes stale reads when files are re-read or edited, but preserves summarize+keepLines decisions.
@@ -21,20 +21,9 @@ Or from source:
 pi install https://github.com/eengad/pi-sift
 ```
 
-## Benchmark results (SWE-ReBench, claude-opus-4-6, N=1 per task)
+## Benchmark
 
-Only tasks where pi-sift made at least one decision are shown — zero-decision runs are uninformative about the extension.
-
-| Instance | Decisions | B tokens | E tokens | Δ tokens | Δ cost | B tests | E tests |
-|---|---|---|---|---|---|---|---|
-| haystack-9527 | 1 | 204k | 151k | **-26%** | +31% | 25p/2f | 25p/2f |
-| sympy-28122 | 1 | 499k | 274k | **-45%** | **-24%** | 101p/0f ✓ | 101p/0f ✓ |
-| PyDough-368 | 6 | 4,075k | 2,649k | **-35%** | **-19%** | 127p/1f | 127p/1f |
-| avroschema-870 | 3 | 913k | 977k | +7% | +22% | 14p/0f ✓ | 14p/0f ✓ |
-| black-4676 | 1 | 53k | 71k | +34% | +81% | 144p/0f ✓ | 144p/0f ✓ |
-| fromager-626 | 1 | 281k | 229k | -18% | +9% | 7p/0f ✓ | 6p/1f |
-
-✓ = resolved. Single runs — variance applies, especially on 1-decision tasks. The three largest tasks (sympy, PyDough, haystack) show consistent token and cost reduction. black and fromager are likely noise: black's decision added overhead on a small task; fromager's decision fired at the last turn. Full results in [`benchmark-status.md`](./benchmark-status.md).
+An A/B benchmark script is included for evaluating pi-sift on [SWE-ReBench](https://github.com/swe-bench/SWE-ReX) tasks. See [A/B benchmark](#ab-benchmark) below for usage. Early results with Claude Opus 4.6 show token reductions of 17–59% on tasks where the model makes scoring decisions, though single-run variance is high and more data is needed.
 
 ## Local development
 
@@ -70,7 +59,7 @@ npm run analyse-session -- /tmp/tmp.XXX/task_0/extension_run1/sessions/*.jsonl
 ## Model compatibility
 
 - **Claude Opus 4.6** — works well. The model follows scoring instructions reliably and uses `keepLines` effectively.
-- **OpenAI Codex 5.3 (xhigh thinking)** — does not work. The model sees the scoring instruction (thinking summaries confirm it considers emitting `<context_lens>` blocks) but consistently skips scoring and emits only tool calls. This may improve with future Codex versions.
+- **OpenAI Codex 5.3 (xhigh thinking)** — partially works. The model sees the scoring instruction (confirmed via debug logging) but only follows it ~33% of the time, skipping scoring and emitting tool calls instead. When it does follow, it produces valid summarize decisions. Tasks still resolve but with higher token usage than Opus.
 
 ## Known issues
 
