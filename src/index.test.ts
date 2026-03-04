@@ -551,12 +551,17 @@ describe("Mode A inline scoring flow", () => {
 		}
 		assert.ok(ctxResult, "context should be modified");
 
+		// Invalid-id reminder should be appended to existing user message
 		const userText = ctxResult.messages[0].content
 			.filter((b: any) => b?.type === "text")
 			.map((b: any) => b.text)
 			.join("\n");
 		assert.ok(userText.includes("[pi-sift reminder]"), "should inject invalid-id reminder");
-		assert.ok(userText.includes("toolCallIds to score: tc-known"), "should still inject scoring instruction");
+
+		// Scoring instruction should be a separate user message at end
+		const lastMsg = ctxResult.messages[ctxResult.messages.length - 1];
+		assert.equal(lastMsg.role, "user", "scoring instruction should be a separate user message");
+		assert.ok(String(lastMsg.content[0].text).includes("toolCallIds to score: tc-known"), "should still inject scoring instruction");
 	});
 });
 

@@ -661,9 +661,14 @@ export default function piSift(pi: ExtensionAPI) {
 		const toPrompt = Array.from(pendingDecisions.values()).filter((pending) => !pending.instructionInjected);
 		if (toPrompt.length > 0) {
 			const instruction = buildScoringInstruction(toPrompt);
-			// Append to the last user message instead of pushing a new one,
-			// so scoring instructions remain invisible as standalone chat messages.
-			appendToLastUserMessage(instruction);
+			// Push as a separate user message at the end of context so the model
+			// sees it right before responding. The context hook operates on a deep
+			// copy, so this is ephemeral and not persisted to the session.
+			event.messages.push({
+				role: "user",
+				content: [{ type: "text", text: instruction }],
+				timestamp: Date.now(),
+			});
 			for (const pending of toPrompt) pending.instructionInjected = true;
 			changed = true;
 		}

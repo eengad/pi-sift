@@ -36,6 +36,9 @@ Possible approaches:
 - **Synthetic user turn**: inject a user message before the next API call that only contains the scoring instruction, forcing a text response. Intrusive — adds a visible turn.
 - **Count all turns** (not just text-bearing) toward the fallback threshold. Wouldn't force scoring but would at least resolve pending state sooner.
 
+Rejected approach:
+- **Wrap toolResult content** with scoring preamble + reminder. Tested in benchmarks — caused the model to choose `keep` instead of `summarize`, resulting in 2x token increase on task 25 (926k vs 430k). Embedding the instruction in a toolResult (data) weakened it compared to the user message (authoritative). The model treats user messages as instructions and tool results as data, even when the content is identical.
+
 None of these are great. Opus scores reliably enough that this isn't urgent, but it's the main gap for non-Anthropic models.
 
 ## Fork-based A/B benchmarking
