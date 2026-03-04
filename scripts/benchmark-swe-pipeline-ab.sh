@@ -450,6 +450,13 @@ try:
             "passed_tests": len(execution_result.passed_tests or []),
             "failed_tests": len(execution_result.failed_tests or []),
         })
+        # Save raw test output for debugging test parsing issues
+        import os
+        verify_dir = os.path.dirname(os.path.abspath(sys.argv[4]))
+        with open(os.path.join(verify_dir, "test_output.txt"), "w") as f:
+            f.write(execution_result.stdout or "")
+            f.write("\n--- STDERR ---\n")
+            f.write(execution_result.stderr or "")
 except Exception as e:
     result.update({
         "verify_ok": False,

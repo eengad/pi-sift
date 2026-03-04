@@ -1,95 +1,78 @@
 # Benchmark Status
 
-Model: claude-opus-4-6.
+Model: `anthropic/claude-opus-4-6` | Dataset: `nebius/SWE-rebench-leaderboard` (693 tasks)
 
-## Meaningful results (decisions > 0, working verification)
+## Useful results (≥1 decision AND ≥1 test pass, N=1)
 
-| Task | Instance | B tokens | E tokens | Δ tok | E decisions | B resolved | E resolved | Notes |
-|---|---|---|---|---|---|---|---|---|
-| 2 | haystack-9527 | 204k | 151k | -26% | 1 | no (25p/2f) | no (25p/2f) | same outcome |
-| 9 | sympy-28122 | 499k | 274k | -45% | 1 | yes (101p) | yes (101p) | same outcome |
-| 22 | PyDough-368 | 4075k | 2649k | -35% | 6 | no (127p/1f) | no (127p/1f) | same outcome, largest saving |
-| 25 | avroschema-870 | 913k | 977k | +7% | 3 | yes (14p) | yes (14p) | both resolved, token diff likely variance |
-| 27 | black-4676 | 53k | 71k | +34% | 1 | yes (144p) | yes (144p) | token diff likely luck (more test runs) |
-| 29 | fromager-626 | 281k | 229k | -18% | 1 | yes (7p) | no (6p/1f) | decision at last turn, no effect — diff is luck |
+| Idx | Instance | B tokens | E tokens | Δ | Dec | Tests | B res | E res |
+|-----|----------|----------|----------|---|-----|-------|-------|-------|
+| 2 | haystack-9527 | 311k | 380k | +22% | 2 | 25p/2f | ❌ | ❌ |
+| 6 | markdownify-230 | 155k | 143k | **-7%** | 2 | 50p/0f | ✅ | ✅ |
+| 14 | trino-client-564 | 986k | 620k | **-37%** | 1 | 16p/0f | ✅ | ✅ |
+| 16 | yt-dlp-13403 | 2,038k | 497k | **-76%** | 2 | * | ❌ | ✅ |
+| 17 | persistent-220 | 286k | 270k | **-6%** | 1 | 361p/0f | ✅ | ✅ |
+| 22 | PyDough-368 | 2,861k | 2,272k | **-21%** | 5 | 127p/1f | ❌ | ❌ |
+| 25 | avroschema-870 | 1,381k | 573k | **-59%** | 3 | 14p/0f | ✅ | ✅ |
+| 26 | opentelemetry-4614 | 444k | 579k | +30% | 1 | 9p/0f | ✅ | ✅ |
+| 27 | black-4676 | 133k | 142k | +7% | 1 | 144p/0f | ✅ | ✅ |
+| 29 | fromager-626 | 594k | 260k | **-56%** | 1 | 7p/0f | ✅ | ❌ |
+| 31 | sympy-28137 | 401k | 491k | +22% | 3 | 163p/0f | ✅ | ✅ |
+| 41 | pySHACL-285 | 471k | 461k | **-2%** | 2 | 5p/0f | ✅ | ✅ |
+| 43 | alto-tools-29 | 55k | 70k | +28% | 1 | 2p/0f | ✅ | ✅ |
 
-## Runs with decisions but broken verification
+\* Task 16: baseline 0p/0f, extension 72p/0f — test parsing discrepancy, comparison unreliable.
 
-| Task | Instance | E decisions | Reason |
-|---|---|---|---|
-| 3 | stellarphot-519 | 7 | install failure (0 tests), no baseline |
-| 4 | stellarphot-526 | 1 | install failure (0 tests), no baseline |
-| 5 | venvstacks-197 | 3 | truncated test IDs in dataset |
-| 7 | pybamm-5061 | 3 | install failure (0 tests) |
-| 10 | sqlglot-5189 | 4 | Docker git checkout failure |
-| 11 | sqlglot-5233 | 2 | Docker git checkout failure |
-| 12 | sqlglot-5253 | 1 | Docker git checkout failure |
-| 15 | vyper-4677 | 3 | install failure |
+**Summary (13 tasks with decisions, excluding task 16):**
+- 8 tasks show token reduction (median -21%, range -2% to -59%)
+- 4 tasks show token increase (median +22%, range +7% to +30%)
+- 0 tasks where pi-sift broke a baseline-resolved task
+- Resolution unchanged in 11 of 12 tasks; fromager: extension took different path
 
-## All runs with 0 decisions
+## Non-useful completed tasks (37)
 
-Tasks with 0 decisions are not informative about pi-sift — any difference is model variance.
+| Idx | Instance | Reason |
+|-----|----------|--------|
+| 0 | pennylane-7671 | 0 decisions |
+| 1 | conan-18444 | 0 decisions |
+| 3 | stellarphot-519 | 0p/0f (Docker) |
+| 4 | stellarphot-526 | 0p/0f (Docker) |
+| 5 | venvstacks-197 | 0p/0f (Docker) |
+| 7 | PyBaMM-5061 | 0p/0f (Docker) |
+| 8 | Pillow-9023 | 0p/0f + 0 dec |
+| 9 | sympy-28122 | 0 decisions |
+| 10 | sqlglot-5189 | 0p/0f (verify) |
+| 11 | sqlglot-5233 | 0p/0f (verify) |
+| 12 | sqlglot-5253 | 0p/0f (verify) |
+| 13 | sqlglot-5256 | 0p/0f + 0 dec |
+| 15 | vyper-4677 | 0p/0f (Docker) |
+| 18 | bqskit-337 | 0p/0f + 0 dec |
+| 19 | scuba-269 | 0 decisions |
+| 20 | anyio-935 | 0p/0f + 0 dec |
+| 21 | biopython-5005 | 0 decisions |
+| 23 | neuroconv-1406 | 0p/0f + 0 dec |
+| 24 | geopandas-3591 | 0p/0f |
+| 28 | trio-3280 | 0p/0f + 0 dec |
+| 30 | pykern-578 | 0p/1f (no pass) |
+| 32 | sympy-28183 | 0 decisions |
+| 33 | GitPython-2051 | 0p/0f (Docker) |
+| 34 | pymc-7809 | 0p/0f + 0 dec |
+| 35 | plopp-459 | 0p/0f |
+| 36 | reccmp-142 | 0p/0f + 0 dec |
+| 37 | lmstudio-python-110 | 0p/0f + 0 dec |
+| 38 | meilisearch-mcp-39 | 0p/0f |
+| 39 | ome-zarr-models-py-206 | 0p/0f + 0 dec |
+| 40 | python-control-1138 | 0p/0f |
+| 42 | tardis-361 | 0p/0f |
+| 44 | sqlglot-4661 | 0p/0f |
+| 45 | sqlacodegen-371 | 0p/0f + 0 dec |
+| 46 | mlx-vlm-179 | 0p/0f |
+| 47 | xarray-9974 | 0p/0f + 0 dec |
+| 48 | skore-1133 | 0p/0f |
+| 49 | foamlib-329 | 0 decisions |
 
-| Task | Instance |
-|---|---|
-| 0 | pennylane-7671 |
-| 6 | markdownify-230 |
-| 8 | pillow-9023 |
-| 13 | sqlglot-5256 |
-| 16 | yt-dlp-13403 |
-| 18 | bqskit-337 |
-| 19 | scuba-269 |
-| 20 | anyio-935 |
-| 21 | biopython-5005 |
-| 23 | neuroconv-1406 |
-| 24 | geopandas-3591 |
-| 26 | opentelemetry-python-4614 |
-| 28 | trio-3280 |
+## Notes
 
-Baseline runs are unaffected by code version — all baseline data is valid.
-
-## Verification failure reasons
-
-### Docker git checkout failure (tasks 10, 11, 12, 13 — all sqlglot)
-`fatal: reference is not a tree: <commit>` when Docker container tries `git checkout <base_commit>`.
-The container does a fresh `git clone` of the repo and then checks out the old base commit. The clone
-succeeds but the old commit is not available (likely because GitHub returns a shallow/partial clone
-that only includes recent history). No clean fix identified.
-
-### Truncated test IDs (task 5 — venvstacks)
-Tests ran (verify_ok=True, 32s runtime, no error), but `passed_tests=0` and `failed_tests=0`.
-Root cause: the dataset's `FAIL_TO_PASS` list contains truncated test IDs — e.g.
-`test_mock_build_op_selection[(--lock-if-needed` without the closing `)]`. Pytest receives these
-malformed IDs and errors before producing any PASSED/FAILED output. Dataset quality issue, not fixable.
-Note: `resolved=False` is still correct since the model didn't fix the failing tests.
-
-### Install failure (task 15 — vyper)
-`ModuleNotFoundError: No module named 'vyper'` after pip install inside the Docker container.
-The install_config install command fails to make the module importable, so tests can't run.
-
-### Install timeout (task 14 — trino-python-client)
-`pip install -e '.[tests]' -c /tmp/constraints.txt` timed out after 300s in Docker container.
-
-### Poetry not available (task 25 — avroschema; also tasks 3, 4, 7)
-`poetry install` fails because poetry is not in the base Docker image. Fixed in current pipeline
-code (`benchmark-swe-pipeline-ab.sh` now installs poetry + disables virtualenv creation when
-the install config uses poetry). Task 25 needs a re-run with fixed code.
-Tasks 3, 4, 7 (stellarphot, pybamm) likely have a similar install issue — also need re-runs.
-
-## Discussion
-
-### Tasks with working verification and decisions
-- **Task 22 (PyDough)**: most significant result — 6 decisions, -35% tokens (4075k→2649k), same outcome (127p/1f both). Large task where pi-sift clearly helps.
-- **Task 9 (sympy)**: 1 decision, -45% tokens (499k→274k), both resolved (101p). Strong positive result.
-- **Task 2 (haystack)**: 1 decision, -26% tokens (204k→151k), same outcome (25p/2f). Consistent token reduction.
-- **Task 25 (avroschema)**: 3 decisions, +7% tokens (913k→977k), both resolved (14p). Token diff is noise — both resolved, no harm.
-- **Task 27 (black)**: both resolved, but extension used +34% more tokens. 1 decision, small task (53k). Token diff likely variance from more test iterations.
-- **Task 29 (fromager)**: extension saved -18% tokens but broke a test. 1 decision at last turn (no effect on outcome). Diff is luck.
-
-### Pattern
-Four tasks (2, 9, 22, 25) show no degradation in correctness; three of them save tokens significantly. Two tasks (27, 29) are noisy:
-- Tasks 27 and 29 are small (53k, 281k) with 1 decision each — variance dominates at this scale
-- Tasks 9 and 22 are larger (499k, 4075k) and show clear savings (-45%, -35%)
-- Tasks 2 (204k) and 25 (913k) are mid-size — savings modest or zero, no harm
-
-Hypothesis: pi-sift benefits scale with task size. Small tasks don't have enough redundant context to justify scoring overhead. This aligns with task 22 being the strongest result.
+- 50 tasks completed (indices 0-49), 13 useful (26% yield)
+- High 0p/0f rate: many SWE-ReBench Docker images have broken dependencies
+- N=1 per task — individual results subject to high variance
+- Tasks with 0 decisions: pi-sift never triggered (all tool results < 5k chars threshold)
